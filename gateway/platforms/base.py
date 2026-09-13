@@ -119,6 +119,11 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         anchor = reply_to_message_id or getattr(source, "message_id", None)
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
+    if platform == "feishu" and thread_id:
+        # MEDIA sends carry metadata rather than an explicit reply_to argument.
+        anchor = reply_to_message_id or getattr(source, "message_id", None)
+        if anchor:
+            metadata["reply_to_message_id"] = str(anchor)
     # Routed profile (multiplex / profile_routes): outbound prune paths must not assume the
     # adapter's static profile stamp.
     profile = str(getattr(source, "profile", None) or "").strip()
