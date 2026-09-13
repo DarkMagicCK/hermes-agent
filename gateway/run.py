@@ -4038,6 +4038,9 @@ class GatewayRunner(
         if platform == Platform.SLACK and reply_to_message_id is not None:
             # Slack's reply_in_thread=false path uses message_id to tell real threads from synthetic keys.
             metadata["message_id"] = str(reply_to_message_id)
+        if platform == Platform.FEISHU and thread_id and reply_to_message_id:
+            # Post-stream MEDIA delivery also relies on metadata for its reply anchor.
+            metadata["reply_to_message_id"] = str(reply_to_message_id)
         return metadata
 
     @staticmethod
