@@ -1823,19 +1823,22 @@ class TestDedupTTL(unittest.TestCase):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        adapter = FeishuAdapter(PlatformConfig())
-        loop_thread = threading.get_ident()
-        write_threads = []
+        with tempfile.TemporaryDirectory() as temp_home, patch.dict(
+            os.environ, {"HERMES_HOME": temp_home},
+        ):
+            adapter = FeishuAdapter(PlatformConfig())
+            loop_thread = threading.get_ident()
+            write_threads = []
 
-        def fake_write(path, data, *args, **kwargs):
-            write_threads.append(threading.get_ident())
+            def fake_write(path, data, *args, **kwargs):
+                write_threads.append(threading.get_ident())
 
-        with patch("plugins.platforms.feishu.adapter.atomic_json_write", side_effect=fake_write):
-            is_dup = asyncio.run(adapter._is_duplicate("om_new"))
+            with patch("plugins.platforms.feishu.adapter.atomic_json_write", side_effect=fake_write):
+                is_dup = asyncio.run(adapter._is_duplicate("om_new"))
 
-        self.assertFalse(is_dup)
-        self.assertTrue(write_threads)
-        self.assertTrue(all(tid != loop_thread for tid in write_threads))
+            self.assertFalse(is_dup)
+            self.assertTrue(write_threads)
+            self.assertTrue(all(tid != loop_thread for tid in write_threads))
 
     @patch.dict(os.environ, {}, clear=True)
     def test_concurrent_dedup_persists_land_in_order(self):
