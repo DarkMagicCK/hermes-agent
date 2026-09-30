@@ -16,6 +16,7 @@ from plugins.platforms.feishu.adapter import FeishuAdapter
 @pytest.mark.asyncio
 @pytest.mark.parametrize("post_stream", [False, True], ids=["non_streaming", "post_stream"])
 @pytest.mark.parametrize("parent_id", [None, "om_parent"], ids=["topic_seed", "topic_reply"])
+@pytest.mark.parametrize("reply_override", [None, "om_redirected"], ids=["original", "redirected"])
 @pytest.mark.parametrize(
     "filename,directive,message_type",
     [
@@ -26,7 +27,7 @@ from plugins.platforms.feishu.adapter import FeishuAdapter
     ],
 )
 async def test_media_delivery_replies_in_originating_topic(
-    tmp_path, monkeypatch, post_stream, parent_id, filename, directive, message_type,
+    tmp_path, monkeypatch, post_stream, parent_id, reply_override, filename, directive, message_type,
 ):
     monkeypatch.setenv("FEISHU_REACTIONS", "false")
     media = tmp_path / filename
@@ -39,6 +40,7 @@ async def test_media_delivery_replies_in_originating_topic(
     event = MessageEvent(
         text="Send the attachment", message_type=MessageType.TEXT, source=source,
         message_id="om_current", reply_to_message_id=parent_id,
+        reply_anchor_override=reply_override,
     )
     upload = Mock(return_value=SimpleNamespace(
         success=lambda: True, data=SimpleNamespace(file_key="file_key", image_key="image_key"),
@@ -65,7 +67,7 @@ async def test_media_delivery_replies_in_originating_topic(
     messages.list.assert_not_called()
     messages.reply.assert_called_once()
     request = messages.reply.call_args.args[0]
-    assert request.message_id == (event.reply_to_message_id or event.message_id)
+    assert request.message_id == (reply_override or event.reply_to_message_id or event.message_id)
     assert request.request_body.reply_in_thread is True
     assert request.request_body.msg_type == message_type
 
