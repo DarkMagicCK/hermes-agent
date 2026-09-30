@@ -203,7 +203,7 @@ class TestRunSingleChildSchemaValidation:
         assert entry["status"] == "failed"
         assert entry["schema_retries"] == 1
         assert child._delegate_reply_chunks == [correction]
-        assert "not the deliverable" not in entry["summary"]
+        assert entry["summary"] == correction
 
     def test_explicit_delivery_is_validated_before_trailing_prose(self):
         child = _StubChild(

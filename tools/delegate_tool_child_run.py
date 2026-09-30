@@ -481,15 +481,16 @@ def _validate_child_output_schema(
 ) -> _SchemaOutcome:
     """Select the authoritative delivery, then validate an optional schema with ONE bounded retry.
     Schema-less children retain the existing result shape without schema outcome fields."""
-    # Select once before validation and result assembly, even without a schema.
+    # Explicit delivery, when present, is the value validated and returned to the parent.
     delivery = _extract_reply_deliverable(child)
-    if delivery is not None:
+    # Preserve the interrupted loop's placeholder as its error, independently of the delivery.
+    if delivery is not None and not result.get("interrupted", False):
         result["final_response"] = delivery
     _output_schema = getattr(child, "_delegate_output_schema", None)
     if not isinstance(_output_schema, dict):
         return _SchemaOutcome(_output_schema, None, [], 0)
     from tools.delegation_output_schema import build_retry_message, validate_output
-    _first_text = result.get("final_response") or ""
+    _first_text = delivery if delivery is not None else result.get("final_response") or ""
     _schema_valid, _schema_errors = validate_output(_first_text, _output_schema)
     if _schema_valid or not _first_text.strip() or result.get("interrupted", False):
         return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 0)
@@ -513,7 +514,7 @@ def _validate_child_output_schema(
     if isinstance(_retry_result, dict):
         delivery = _extract_reply_deliverable(child)
         _retry_text = delivery if delivery is not None else _retry_result.get("final_response") or ""
-        if _retry_text.strip():
+        if delivery is not None or _retry_text.strip():
             result["final_response"] = _retry_text
         try:
             result["api_calls"] = int(result.get("api_calls", 0) or 0) + int(_retry_result.get("api_calls", 0) or 0)
@@ -574,19 +575,20 @@ def _build_result_entry(
     summary = result.get("final_response") or ""
     # "(empty)" is run_agent's give-up sentinel after repeated empty LLM
     # responses (usually a transport bug) — a failure, not a success.
-    usable_summary = bool(summary) and summary.strip() != "(empty)"
+    usable_summary = bool(summary.strip()) and summary.strip() != "(empty)"
     interrupt_note = ""
     if result.get("interrupted", False):
         status, exit_reason = "interrupted", "interrupted"
         # The loop's final_response is a placeholder here ("Operation interrupted…", also appended as the closing
         # assistant row); the completion must carry what the child actually had so far — its last real assistant
-        # text — and keep the placeholder as the error.
+        # text (or explicit delivery) — and keep the placeholder as the error.
         from agent.message_content import flatten_message_text
         placeholders = {"", summary.strip(), "Operation interrupted."}
         partial = next((t for m in reversed(result.get("messages") or []) if m.get("role") == "assistant"
                         and (t := flatten_message_text(m.get("content")).strip()) not in placeholders), "")
-        if partial:
-            interrupt_note, summary = summary.strip(), partial
+        delivery = _extract_reply_deliverable(child)
+        if delivery is not None or partial:
+            interrupt_note, summary = summary.strip(), delivery if delivery is not None else partial
     elif result.get("failed") or result.get("error"):
         # The loop returns the error text as final_response, which would otherwise read as "completed". Never report a
         # provider rejection as "max_iterations" — that is only truthful for real budget exhaustion.
