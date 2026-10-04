@@ -143,6 +143,8 @@ async def test_auto_voice_and_final_text_share_feishu_policy_on_the_wire(tmp_pat
     from plugins.platforms.feishu.adapter import FeishuAdapter
 
     pytest.importorskip("lark_oapi")
+    from plugins.platforms.feishu.adapter import _load_lark_oapi
+    assert _load_lark_oapi()
     adapter = FeishuAdapter(PlatformConfig(extra={"topic_delivery_fallback": policy}))
     ok = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_sent"))
     wire = SimpleNamespace(

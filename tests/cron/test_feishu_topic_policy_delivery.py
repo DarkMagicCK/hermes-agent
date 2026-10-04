@@ -14,6 +14,9 @@ from plugins.platforms.feishu.adapter import FeishuAdapter
 
 
 def _adapter(policy, *, text_succeeds=False):
+    pytest.importorskip("lark_oapi")
+    from plugins.platforms.feishu.adapter import _load_lark_oapi
+    assert _load_lark_oapi()
     adapter = FeishuAdapter(PlatformConfig(enabled=True, extra={"topic_delivery_fallback": policy}))
     missing = SimpleNamespace(success=lambda: False, code=230011, msg="message withdrawn")
     success = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_sent"))

@@ -16,6 +16,9 @@ from tests.gateway.restart_test_helpers import make_restart_runner
 
 
 def _transport():
+    pytest.importorskip("lark_oapi")
+    from plugins.platforms.feishu.adapter import _load_lark_oapi
+    assert _load_lark_oapi()
     adapter = FeishuAdapter(PlatformConfig(enabled=True, typing_indicator=False))
     response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_sent"))
     wire = SimpleNamespace(

@@ -23,6 +23,9 @@ def failed(code):
 
 @pytest.fixture
 def adapter():
+    pytest.importorskip("lark_oapi")
+    from plugins.platforms.feishu.adapter import _load_lark_oapi
+    assert _load_lark_oapi()  # bind real reply/create/upload builders, not the SDK-absent fallback
     a = FeishuAdapter(PlatformConfig())
     a._client = Mock()
     a._client.im.v1.message.list.return_value = ok(items=[])
@@ -70,10 +73,13 @@ async def test_topic_policy_is_shared_by_every_payload_and_never_recurses(adapte
     creates = adapter._client.im.v1.message.create.call_args_list
     assert len(creates) == (0 if policy == "silent" else 1)
     request = adapter._client.im.v1.message.list.call_args.args[0]
+    from lark_oapi.api.im.v1 import CreateMessageRequest, ListMessageRequest
+    assert isinstance(request, ListMessageRequest)
     assert (request.container_id_type, request.container_id, request.sort_type, request.page_size) == (
         "thread", "omt_topic", "ByCreateTimeDesc", 20)
     if creates:
         request = creates[0].args[0]
+        assert isinstance(request, CreateMessageRequest)
         assert request.receive_id_type == "chat_id"
         assert request.request_body.receive_id == "oc_chat"
         if policy == "error_notice":
