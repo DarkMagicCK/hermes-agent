@@ -17,14 +17,20 @@ from contextlib import suppress
 from copy import copy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, Optional, cast
 
 from agent.i18n import t
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
-from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
+from gateway.platforms.base import (
+    BasePlatformAdapter, SendResult, _mark_notify_metadata,
+)
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
+
+if TYPE_CHECKING:
+    from gateway.run import GatewayRunner
+
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -348,8 +354,8 @@ class GatewayNotificationsMixin:
         return switched
 
     async def _deliver_media_from_response(
-        self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[Dict[str, Any]] = None
-    ) -> None:
+        self: "GatewayRunner", response: str, event: MessageEvent, adapter, thread_metadata: Optional[Dict[str, Any]] = None
+    ) -> Optional[SendResult]:
         """Deliver explicit MEDIA: tags from an already-streamed response (text already delivered).
         EXPLICIT-ONLY, unlike the non-streaming path in ``gateway/platforms/base.py``: a bare local
         path in a streamed reply is shown text or stale inspected content, and promoting it sent
@@ -375,11 +381,16 @@ class GatewayNotificationsMixin:
             # paths in an already-streamed reply are text the user has seen (or stale inspected content),
             # not an attachment request.
             adapter.extract_images(cleaned)
+            event_metadata = getattr(self, "_event_thread_metadata", None)
             _thread_meta = (
-                dict(thread_metadata)
-                if thread_metadata is not None
-                else self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+                dict(thread_metadata) if thread_metadata is not None else
+                event_metadata(event, event.source) if callable(event_metadata) else
+                self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
             )
+            state = (_thread_meta or {}).get("_feishu_topic_delivery")
+            if (isinstance(state, dict)
+                    and getattr(state.get("terminal"), "retry_suppressed", False) is True):
+                return state["terminal"]
             chat_id = event.source.chat_id
             # Images go out as one batch (e.g. Signal's multi-attachment RPC) unless [[as_document]].
             def _is_photo(media_path: str, is_voice: bool) -> bool:
@@ -391,30 +402,34 @@ class GatewayNotificationsMixin:
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    result = await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    if getattr(result, "retry_suppressed", False) is True:
+                        return result
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        result = await adapter.send_voice(
                             chat_id=chat_id, audio_path=media_path, metadata=_thread_meta, is_voice=is_voice,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
+                        result = await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
                     else:
-                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        result = await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                    if getattr(result, "retry_suppressed", False) is True:
+                        return result
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
 
     async def _deliver_queued_first_response(
-        self, response: str, source: SessionSource, adapter,
+        self: "GatewayRunner", response: str, source: SessionSource, adapter,
         metadata: Optional[Dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
-    ) -> bool:
+    ) -> "bool | SendResult":
         """Deliver a queued response using the normal text+attachment split.
 
         ``session_key`` lets the text send record a delivery-ledger obligation like the normal final
@@ -426,8 +441,21 @@ class GatewayNotificationsMixin:
         already delivered it, the reconcile edit landed, the send succeeded, or there was nothing
         textual to send. False: the send was REFUSED (flood control, dead transport) — the caller
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
-        DECLINE returns True: that destination is not approved and must not be re-sent."""
+        DECLINE returns True: that destination is not approved and must not be re-sent. An
+        explicit policy-terminal failure returns its SendResult, never True: callers suppress
+        the retry without claiming the original response was delivered."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        terminal = getattr(stream_consumer, "retry_suppressed_result", None)
+        state = (metadata or {}).get("_feishu_topic_delivery")
+        if terminal is None and isinstance(state, dict):
+            terminal = state.get("terminal")
+        if getattr(terminal, "retry_suppressed", False) is True:
+            text_content = _strip_response_attachments_for_direct_send(response, adapter)
+            if text_content and not text_already_delivered:
+                await self._send_queued_final_text(
+                    adapter, source, text_content, metadata, event_message_id, session_key,
+                    inbound_message_id, suppressed_result=terminal)
+            return cast(SendResult, terminal)
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -451,6 +479,11 @@ class GatewayNotificationsMixin:
                                 _sc_msg_id,
                             )
                         else:
+                            if getattr(_edit_res, "retry_suppressed", False) is True:
+                                await self._send_queued_final_text(
+                                    adapter, source, text_content, metadata, event_message_id, session_key,
+                                    inbound_message_id, suppressed_result=_edit_res)
+                                return _edit_res
                             # P5(b): a DECLINE is not "editing unavailable". The
                             # send below re-delivers the whole response to the
                             # chat the connector just refused.
@@ -469,6 +502,8 @@ class GatewayNotificationsMixin:
                     _sent = await self._send_queued_final_text(
                         adapter, source, text_content, metadata, event_message_id, session_key,
                         inbound_message_id)
+                    if getattr(_sent, "retry_suppressed", False) is True:
+                        return _sent
                     if not getattr(_sent, "success", False):
                         # The text never landed. Report it undelivered and skip the attachments too:
                         # the caller's normal completion send replays the whole response (text and
@@ -478,16 +513,22 @@ class GatewayNotificationsMixin:
         # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
         if not deliver_media:
             return True
-        await self._deliver_media_from_response(
+        media_result = await self._deliver_media_from_response(
             response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
             thread_metadata=metadata,
         )
+        if media_result is not None and media_result.retry_suppressed is True:
+            # The body reached the chat, but an attachment did not. Keep that distinction
+            # on this receipt without mutating the shared per-turn terminal policy result.
+            media_result = copy(media_result)
+            media_result._text_already_delivered = True
+            return media_result
         return True
 
     async def _send_queued_final_text(
         self, adapter, source: SessionSource, text_content: str, metadata: Optional[Dict[str, Any]],
         event_message_id: Optional[str], session_key: Optional[str],
-        inbound_message_id: Optional[str] = None,
+        inbound_message_id: Optional[str] = None, *, suppressed_result=None,
     ):
         """Send a queued-lane final through the same ledger bracket as the normal final
         (``send_final_ledgered``). This lane used to call ``adapter.send`` bare and discard the
@@ -500,7 +541,11 @@ class GatewayNotificationsMixin:
         if session_key and isinstance(adapter, BasePlatformAdapter):
             result, _ = await adapter.send_final_ledgered(
                 MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
-                session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)
+                session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id,
+                **({"suppressed_result": suppressed_result}
+                   if getattr(suppressed_result, "retry_suppressed", False) is True else {}))
+        elif getattr(suppressed_result, "retry_suppressed", False) is True:
+            result = suppressed_result
         else:
             result = await adapter.send(source.chat_id, text_content, metadata=metadata)
         if not getattr(result, "success", False):
@@ -1332,19 +1377,19 @@ class GatewayNotificationsMixin:
             # it: by delivery time the user has often continued elsewhere, and an event anchored
             # there makes the finished job's reply quote that old message on every reply-anchoring
             # platform (#52694: a background completion visibly replying to a stale Discord DM
-            # message). Routing is unaffected — topic lanes carry thread_id and the anchor-less
-            # synthetic-send branches are covered (#87051); the original id rides metadata for
-            # debugging only.
+            # message). Feishu topics are the exception: thread_id alone cannot route a send,
+            # so retain the anchor as routing state, never as a synthetic lifecycle message_id.
             trigger_message_id = str(evt.get("message_id") or "").strip() or None
             if trigger_message_id:
                 metadata["original_trigger_message_id"] = trigger_message_id
-            if getattr(source, "message_id", None):
+            feishu_topic = source.platform == Platform.FEISHU and bool(source.thread_id)
+            topic_anchor = (trigger_message_id or getattr(source, "message_id", None)) if feishu_topic else None
+            if getattr(source, "message_id", None) and not feishu_topic:
                 from gateway.session_identity import replace_source
                 source = replace_source(source, message_id=None)
             synth_event = MessageEvent(
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
-                metadata=metadata,
-
+                metadata=metadata, reply_anchor_override=topic_anchor,
             )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
@@ -1961,17 +2006,25 @@ class GatewayNotificationsMixin:
         adapter = self._resolve_injection_adapter(platform_name, source)
         return session_key in (getattr(adapter, "_active_sessions", None) or {})
 
-    async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> None:
+    async def _send_watcher_message(self: "GatewayRunner", platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> None:
         from gateway.run import _non_conversational_metadata
         source = await asyncio.to_thread(self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
         if adapter and chat_id:
             with _log_suppressed(logging.ERROR, "Watcher delivery error: %s"):
                 send_meta = {"thread_id": thread_id} if thread_id else None
+                # Prefer the persisted topic route, with its real message anchor. Other
+                # platforms keep upstream's anchorless notification semantics.
+                send_kwargs = {}
+                if source and source.platform == Platform.FEISHU and source.thread_id:
+                    chat_id = source.chat_id
+                    anchor = str(watcher.get("message_id") or "").strip() or source.message_id
+                    send_meta = self._thread_metadata_for_source(source, anchor)
+                    send_kwargs["reply_to"] = anchor
                 await adapter.send(
                     chat_id, message_text,
-                    reply_to=str(watcher.get("message_id") or "").strip() or getattr(source, "message_id", None),
                     metadata=_non_conversational_metadata(send_meta, platform=platform_name),
+                    **send_kwargs,
                 )
 
     @staticmethod

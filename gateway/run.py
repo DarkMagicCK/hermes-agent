@@ -761,6 +761,10 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
 
     See #30045.
     """
+    state = (metadata or {}).get("_feishu_topic_delivery")
+    terminal = state.get("terminal") if isinstance(state, dict) else None
+    if getattr(terminal, "retry_suppressed", False) is True:
+        return terminal
     sender = getattr(adapter, "send_or_update_status", None)
     if callable(sender):
         return await sender(chat_id, status_key, content, metadata=metadata)
@@ -784,6 +788,9 @@ def _approval_send_outcome(future, timeout: float) -> str:
         return "failed"
     if getattr(result, "success", False):
         return "sent"
+    if getattr(result, "retry_suppressed", False) is True:
+        logger.warning("Prompt delivery stopped by adapter policy: %s", getattr(result, "error", None))
+        return "suppressed"
     # P5(b): a connector DECLINE is not a lane failure. The connector
     # authorized the destination and refused it; re-sending the same content as
     # plain text into that same chat is the exfiltration the egress guard
@@ -4236,6 +4243,8 @@ class GatewayRunner(
         if platform == Platform.SLACK and reply_to_message_id is not None:
             # Slack's reply_in_thread=false path uses message_id to tell real threads from synthetic keys.
             metadata["message_id"] = str(reply_to_message_id)
+        if platform == Platform.FEISHU and thread_id and reply_to_message_id is not None:
+            metadata["reply_to_message_id"] = str(reply_to_message_id)
         return metadata
 
     @staticmethod

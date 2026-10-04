@@ -577,6 +577,54 @@ Inbound messages are deduplicated using message IDs with a 24-hour TTL. The dedu
 
 WebSocket and per-group ACL settings are configured via `config.yaml` under `platforms.feishu.extra` (see [WebSocket Tuning](#websocket-tuning) and [Per-Group Access Control](#per-group-access-control) above).
 
+## Topic delivery fallback
+
+Configure topic-delivery behavior in `config.yaml`:
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      topic_delivery_fallback: main_chat
+```
+
+Hermes first replies to the known message in the topic. If the anchor is missing or
+Feishu explicitly reports it withdrawn/missing (230011 or 231003), Hermes queries
+recent topic messages with `ByCreateTimeDesc`, skips deleted/already-failed anchors,
+and tries at most three replacement anchors. An explicit routing rejection
+(99992402, including audio delivery) follows the same recovery and fallback policy.
+
+If no usable anchor remains, or the bot cannot resolve one because history lookup
+is unavailable (for example missing history-read permission), the configured policy
+uses the known originating parent group. The send API still enforces the bot's access:
+
+
+- `main_chat` (default, including omitted, null or blank values): send the full
+  original reply/media to the parent group chat on a best-effort basis. Remaining
+  chunks and attachments from that turn follow the same route
+- `error_notice`: post one content-free diagnostic in the parent chat. It contains a
+  correlation reference, stage, API code, chat/topic/message/app IDs and message type
+  for administrators to match to backend logs. The original reply is not delivered
+- `silent`: record the failure in backend logs only. The original reply is not delivered
+
+The policy is shared by text, rich posts, progress/stream output, images, files,
+voice/audio and captions. Diagnostics never include original text, captions, file
+paths, credentials or raw exception traces. A failed diagnostic is logged without
+recursive notices. Suppressed deliveries are failures, not successful original
+replies, and are not replayed by the delivery ledger.
+
+Authentication, permission, network and rate-limit failures of an actual message
+send do not establish that its topic anchor is stale and do not redirect that send
+to a broader chat. An ambiguous send timeout may already have delivered content;
+Hermes does not follow it with a new plaintext message. History lookup failures are
+classified separately as `lookup_failed`: no original content was sent by that read.
+Successful anchor recovery remains in the same topic.
+
+`FEISHU_TOPIC_DELIVERY_FALLBACK` is an optional override, read through the owning
+profile's scoped settings with precedence environment → YAML → default. Prefer
+`config.yaml` for this behavioral setting. A secondary profile never borrows the
+launch profile's override. Any other nonempty value rejects the adapter configuration.
+
 ## Troubleshooting
 
 | Problem | Fix |

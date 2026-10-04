@@ -278,7 +278,9 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
     assert synth_event.source.thread_id == "42"
     assert synth_event.source.user_id == "123"
     assert synth_event.source.user_name == "Emiliyan"
-    assert synth_event.message_id == (event_anchor.strip() if event_anchor and event_anchor.strip() else "om_thread_root")
+    assert synth_event.message_id is None
+    assert synth_event.reply_anchor_override is None
+    assert synth_event.source.message_id is None
 
 
 @pytest.mark.asyncio
@@ -320,7 +322,8 @@ async def test_legacy_source_anchor_survives_second_detach(monkeypatch, tmp_path
     assert await runner._inject_watch_notification("first completion", evt) is True
     first = adapter.handle_message.await_args.args[0]
     expected_anchor = origin.message_id or "om_captured"
-    assert first.message_id == "om_captured"
+    assert first.message_id is None
+    assert first.reply_anchor_override == "om_captured"
     assert first.source.to_dict() == {**original_identity, "message_id": expected_anchor}
     assert first.source._transport_marker is transport_marker
     assert origin.to_dict() == original_identity
@@ -348,7 +351,8 @@ async def test_legacy_source_anchor_survives_second_detach(monkeypatch, tmp_path
         assert second["message_id"] == expected_anchor
         assert await runner._inject_watch_notification("second completion", second) is True
         reinjected = adapter.handle_message.await_args.args[0]
-        assert reinjected.message_id == expected_anchor
+        assert reinjected.message_id is None
+        assert reinjected.reply_anchor_override == expected_anchor
         assert reinjected.source.to_dict() == first.source.to_dict()
     finally:
         ad._reset_for_tests()
@@ -575,7 +579,8 @@ class TestConciseFormatter:
 
 
 @pytest.mark.asyncio
-async def test_concise_mode_sends_pretty_message_not_raw_dump(monkeypatch, tmp_path):
+@pytest.mark.parametrize("platform", [Platform.TELEGRAM, Platform.FEISHU])
+async def test_concise_mode_sends_pretty_message_not_raw_dump(monkeypatch, tmp_path, platform):
     """Default mode: a finished process produces the one-line status message,
     never the '[Background process ... Here's the final output: ...]' wall."""
     import tools.process_registry as pr_module
@@ -594,23 +599,28 @@ async def test_concise_mode_sends_pretty_message_not_raw_dump(monkeypatch, tmp_p
     monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
 
     runner = _build_runner(monkeypatch, tmp_path, "concise")
-    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter = runner.adapters.pop(Platform.TELEGRAM)
+    runner.adapters[platform] = adapter
+    watcher = _watcher_dict(thread_id="omt_topic", message_id="om_thread_root")
+    watcher.update(platform=platform.value, chat_type="group")
 
-    await runner._run_process_watcher(
-        _watcher_dict(thread_id="omt_topic", message_id="om_thread_root")
-    )
+    await runner._run_process_watcher(watcher)
 
     adapter.send.assert_awaited_once()
     sent_text = adapter.send.await_args.args[1]
     assert sent_text.startswith("✅ Background task finished")
     assert "Here's the final output" not in sent_text
     assert "5000" not in sent_text
-    assert adapter.send.await_args.kwargs["reply_to"] == "om_thread_root"
+    expected_anchor = "om_thread_root" if platform == Platform.FEISHU else None
+    assert adapter.send.await_args.kwargs.get("reply_to") == expected_anchor
+    if expected_anchor:
+        assert adapter.send.await_args.kwargs["metadata"]["reply_to_message_id"] == expected_anchor
 
 
 @pytest.mark.asyncio
-async def test_all_mode_threads_interim_and_final_notifications(monkeypatch, tmp_path):
-    """Both direct watcher send paths preserve the captured reply anchor."""
+@pytest.mark.parametrize("platform", [Platform.TELEGRAM, Platform.FEISHU])
+async def test_all_mode_threads_interim_and_final_notifications(monkeypatch, tmp_path, platform):
+    """Only Feishu topics require the captured anchor for both watcher send paths."""
     import tools.process_registry as pr_module
 
     running = SimpleNamespace(
@@ -630,15 +640,17 @@ async def test_all_mode_threads_interim_and_final_notifications(monkeypatch, tmp
     monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
-    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter = runner.adapters.pop(Platform.TELEGRAM)
+    runner.adapters[platform] = adapter
+    watcher = _watcher_dict(thread_id="omt_topic", message_id="om_thread_root")
+    watcher.update(platform=platform.value, chat_type="group")
 
-    await runner._run_process_watcher(
-        _watcher_dict(thread_id="omt_topic", message_id="om_thread_root")
-    )
+    await runner._run_process_watcher(watcher)
 
     assert adapter.send.await_count == 2
+    expected_anchor = "om_thread_root" if platform == Platform.FEISHU else None
     assert all(
-        call.kwargs["reply_to"] == "om_thread_root"
+        call.kwargs.get("reply_to") == expected_anchor
         for call in adapter.send.await_args_list
     )
 

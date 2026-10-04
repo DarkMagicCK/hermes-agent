@@ -201,59 +201,17 @@ class TestFeishuFallbackThreadRouting:
         assert request.request_body.reply_in_thread is True
 
     @pytest.mark.asyncio
-    async def test_thread_send_without_anchor_falls_back_to_chat_create(self):
-        """When reply_to is None and metadata has thread_id but no anchor,
-        fall back to a top-level chat create — NOT an invalid
-        receive_id_type=thread_id. The Feishu API rejects thread_id."""
+    async def test_raw_topic_send_cannot_bypass_topic_policy(self):
+        from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        mock_client = MagicMock()
-        mock_create_response = SimpleNamespace(
-            success=lambda: True,
-            data=SimpleNamespace(message_id="new_msg_1"),
-        )
-        mock_client.im.v1.message.create = MagicMock(return_value=mock_create_response)
-        mock_client.im.v1.message.reply = MagicMock()
-
-        adapter = MagicMock(spec=FeishuAdapter)
-        adapter._client = mock_client
-        adapter._build_create_message_body = FeishuAdapter._build_create_message_body
-        adapter._build_create_message_request = FeishuAdapter._build_create_message_request
-        async def _run_blocking_passthrough(func, *args):
-            return func(*args)
-        adapter._run_blocking = _run_blocking_passthrough
-
-        import json
-        await FeishuAdapter._send_raw_message(
-            adapter,
-            chat_id="oc_main_chat",
-            msg_type="text",
-            payload=json.dumps({"text": "hello"}),
-            reply_to=None,
-            metadata={"thread_id": "omt_topic_abc"},
-        )
-
-        mock_client.im.v1.message.create.assert_called_once()
-        mock_client.im.v1.message.reply.assert_not_called()
-        call_args = mock_client.im.v1.message.create.call_args[0][0]
-        receive_id_type = getattr(call_args, "receive_id_type", None)
-        assert receive_id_type != "thread_id", (
-            f"receive_id_type must NOT be 'thread_id' (Feishu rejects it); "
-            f"got '{receive_id_type}'"
-        )
-        assert receive_id_type == "chat_id", (
-            f"Expected top-level fallback receive_id_type='chat_id', "
-            f"got '{receive_id_type}'"
-        )
-        # receive_id must be the chat_id, never the omt_ thread id.
-        body = getattr(call_args, "body", None) or getattr(call_args, "request_body", None)
-        receive_id = getattr(body, "receive_id", None)
-        if receive_id is None and isinstance(body, str):
-            import json as _json
-            receive_id = _json.loads(body).get("receive_id")
-        assert receive_id == "oc_main_chat", (
-            f"Expected receive_id='oc_main_chat', got '{receive_id}'"
-        )
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = MagicMock()
+        with pytest.raises(ValueError, match="topic delivery policy"):
+            await adapter._send_raw_message(
+                chat_id="oc_main_chat", msg_type="text", payload='{"text":"hello"}',
+                reply_to=None, metadata={"thread_id": "omt_topic"})
+        adapter._client.im.v1.message.create.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_create_uses_chat_id_when_no_thread(self):

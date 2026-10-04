@@ -545,6 +545,7 @@ class TurnRunner:
         _progress_len_fn: Any
         _PROGRESS_TEXT_LIMIT: int
         _edit_accepts_metadata: bool
+        retry_suppressed_result: Any = None
 
     def _progress_edit_state(self, adapter) -> "TurnRunner._ProgressEditState":
         ctx = self._ctx
@@ -577,7 +578,10 @@ class TurnRunner:
             kwargs["finalize"] = True
         if st._edit_accepts_metadata:
             kwargs["metadata"] = ctx._progress_metadata
-        return await st.adapter.edit_message(**kwargs)
+        result = await st.adapter.edit_message(**kwargs)
+        if getattr(result, "retry_suppressed", False) is True:
+            st.retry_suppressed_result = result
+        return result
 
     @staticmethod
     def _progress_text(lines: list) -> str:
@@ -597,9 +601,14 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
+        suppressed = getattr(st, "retry_suppressed_result", None)
+        if suppressed is not None:
+            return suppressed
         result = await st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
         )
+        if getattr(result, "retry_suppressed", False) is True:
+            st.retry_suppressed_result = result
         self._track_progress_result(result)
         return result
 
@@ -609,6 +618,8 @@ class TurnRunner:
         Returns True when it delivered/split the buffer or a transient edit failure left it
         intact for retry — either way the caller skips the normal send/edit path this tick.
         """
+        if st.retry_suppressed_result is not None:
+            return True
         if not st.progress_lines or not st.can_edit:
             return False
         groups = self._split_progress_groups(st, st.progress_lines)
@@ -617,6 +628,8 @@ class TurnRunner:
         if st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(groups[0]))
             if not result.success:
+                if getattr(result, "retry_suppressed", False) is True:
+                    return True
                 if getattr(result, "retryable", False):
                     logger.debug("[%s] Transient overflow edit failure — keeping can_edit=True", st.adapter.name)
                     return True
@@ -626,6 +639,8 @@ class TurnRunner:
             groups = groups[1:]
         for group in groups:
             result = await self._send_progress_text(st, self._progress_text(group))
+            if getattr(result, "retry_suppressed", False) is True:
+                return True
             if result.success and result.message_id:
                 st.progress_msg_id = result.message_id
         # The newest continuation is the only mutable bubble: keep just its lines so later
@@ -655,7 +670,7 @@ class TurnRunner:
         return raw
 
     async def _flush_progress_edit(self, st) -> None:
-        if st.can_edit and st.progress_lines and st.progress_msg_id:
+        if st.retry_suppressed_result is None and st.can_edit and st.progress_lines and st.progress_msg_id:
             with suppress(Exception):
                 await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
 
@@ -681,7 +696,7 @@ class TurnRunner:
     async def _progress_restore_typing(self, st) -> None:
         ctx = self._ctx
         await asyncio.sleep(0.3)
-        if ctx._run_still_current():
+        if ctx._run_still_current() and st.retry_suppressed_result is None:
             await st.adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
 
     async def _progress_send_or_edit(self, st, msg) -> bool:
@@ -690,8 +705,12 @@ class TurnRunner:
         Transient network errors (ConnectError, timeouts) must not disable editing; only permanent
         failures (not found, permissions) set can_edit=False. Flood control backs off but keeps editing.
         """
+        if st.retry_suppressed_result is not None:
+            return True
         if st.can_edit and st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, "\n".join(st.progress_lines))
+            if getattr(result, "retry_suppressed", False) is True:
+                return True
             if result.success:
                 return True
             if getattr(result, "retryable", False):
@@ -729,7 +748,7 @@ class TurnRunner:
         EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
         while True:
             try:
-                if not ctx._run_still_current():
+                if not ctx._run_still_current() or st.retry_suppressed_result is not None:
                     self._drain_progress_queue()
                     return
                 raw = ctx.progress_queue.get_nowait()
@@ -1525,6 +1544,8 @@ class TurnRunner:
                         "exec approval undeliverable: connector egress declined "
                         "this destination"
                     )
+                if getattr(fut.result(timeout=0), "retry_suppressed", False) is True:
+                    raise _ExecApprovalDeclined("exec approval undeliverable: delivery policy suppressed retries")
                 logger.warning("Button-based approval failed (send returned error), falling back to text")
             except _ExecApprovalDeclined:
                 # Must escape this handler: the fallback below is a text send to
@@ -1543,10 +1564,14 @@ class TurnRunner:
                 adapter.send(ctx._status_chat_id, msg, metadata=_interim_metadata(metadata)), "Approval text-send scheduling error",
             )
             if fut is not None:
-                fut.result(timeout=15)
+                sent = fut.result(timeout=15)
+                if getattr(sent, "retry_suppressed", False) is True:
+                    raise _ExecApprovalDeclined("exec approval undeliverable: delivery policy suppressed retries")
                 # No card to edit on the text path: the prompt has no buttons to drop and carries
                 # the /approve instructions, so the timeout notice is posted as a new message.
                 register_timeout_notice(self, approval_data, command=cmd, card_message_id=None)
+        except _ExecApprovalDeclined:
+            raise
         except Exception as e:
             logger.error("Failed to send approval request: %s", e)
 

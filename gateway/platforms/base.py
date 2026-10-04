@@ -134,6 +134,12 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         anchor = reply_to_message_id or getattr(source, "message_id", None)
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
+    if platform == "feishu" and thread_id:
+        # Feishu topics have no create-message route: metadata-only sends need a real
+        # message anchor too (progress, notices, and post-stream attachments).
+        anchor = reply_to_message_id or getattr(source, "message_id", None)
+        if anchor is not None:
+            metadata["reply_to_message_id"] = str(anchor)
     # Routed profile (multiplex / profile_routes): outbound prune paths must not assume the
     # adapter's static profile stamp.
     profile = str(getattr(source, "profile", None) or "").strip()
@@ -144,7 +150,17 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
 
 def _thread_metadata_for_event(event) -> dict | None:
     """``_thread_metadata_for_source`` for an event, anchored on its reply id."""
-    return _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+    metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+    if (metadata is not None and _platform_name(getattr(event.source, "platform", None)) == "feishu"
+            and getattr(event.source, "thread_id", None)):
+        # Every send in this turn shares the topic-policy decision, including metadata
+        # rebuilt for progress, final text and attachments. Keep it off the serializable
+        # event.metadata/source so a later turn in this topic starts with a fresh decision.
+        state = getattr(event, "_feishu_topic_delivery", None)
+        if not isinstance(state, dict):
+            state = event._feishu_topic_delivery = {}
+        metadata["_feishu_topic_delivery"] = state
+    return metadata
 
 
 def _mark_notify_metadata(metadata: dict | None) -> dict:
@@ -174,8 +190,9 @@ def _reply_anchor_for_event(event) -> str | None:
         if getattr(source, "chat_type", None) != "dm":
             return None
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
-    if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
-        return getattr(event, "reply_to_message_id", None)
+    if platform == "feishu" and thread_id:
+        return (getattr(event, "reply_to_message_id", None)
+                or getattr(event, "message_id", None) or getattr(source, "message_id", None))
     return getattr(event, "message_id", None)
 
 
@@ -1716,6 +1733,12 @@ class SendResult:
     # SEND_ERROR_KINDS member (failures only) via :func:`classify_send_error`, so consumers
     # branch without substring-matching ``error``.
     error_kind: Optional[str] = None
+    # Explicit adapter policy consumed this failure. The original is NOT delivered; no
+    # fallback, retry, media notice, or durable redelivery may undo that decision.
+    retry_suppressed: bool = False
+    if TYPE_CHECKING:
+        # Queue-local receipt annotation; deliberately not serialized or a public field.
+        _text_already_delivered: bool = False
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
@@ -3025,6 +3048,8 @@ class BasePlatformAdapter(ABC):
                     sender, url_kw = self.send_image, {"image_url": image_url}
                 img_result = await sender(
                     chat_id=chat_id, **url_kw, caption=alt_text or None, metadata=metadata)
+                if getattr(img_result, "retry_suppressed", False) is True:
+                    return img_result
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
                 else:
@@ -3133,7 +3158,9 @@ class BasePlatformAdapter(ABC):
         if result is not None:
             return result
         if caption:
-            await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+            result = await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+            if getattr(result, "retry_suppressed", False) is True:
+                return result
         return SendResult(success=False, error=notice)
 
     def warning_text(self, visible: str, hidden: Optional[str] = "", *, logical_platform=None, chat_id=None, metadata=None) -> Optional[str]:
@@ -3584,7 +3611,7 @@ class BasePlatformAdapter(ABC):
         """Return True for read/write timeouts — NOT retryable and NOT a plain-text
         fallback trigger, because the request may already have been delivered."""
         lowered = (error or "").lower()
-        return any(pat in lowered for pat in ("timed out", "readtimeout", "writetimeout"))
+        return any(pat in lowered for pat in ("timed out", "readtimeout", "writetimeout", "timeouterror"))
 
     def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
         """Unwrap a str/None/:class:`EphemeralReply` response into ``(text, ttl)``. ``ttl > 0``
@@ -3663,7 +3690,7 @@ class BasePlatformAdapter(ABC):
             return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
 
         result = await _send(content)
-        if result.success or self._send_retry_is_final(result):
+        if result.success or getattr(result, "retry_suppressed", False) is True or self._send_retry_is_final(result):
             return result
         error_str = result.error or ""
         # A rate-limited / flood-capped send is transient: it should back off
@@ -3715,7 +3742,7 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
                 error_str = result.error or ""
-                if self._send_retry_is_final(result):
+                if getattr(result, "retry_suppressed", False) is True or self._send_retry_is_final(result):
                     return result
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
@@ -3751,7 +3778,9 @@ class BasePlatformAdapter(ABC):
                 # Not a diagnostic: the requested result itself was lost and this is its only signal.
                 notice = t("gateway.notify.delivery_failed_retry")
                 try:
-                    await _send(notice)
+                    notice_result = await _send(notice)
+                    if getattr(notice_result, "retry_suppressed", False) is True:
+                        return notice_result
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
@@ -4245,7 +4274,8 @@ class BasePlatformAdapter(ABC):
 
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
-        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
+        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool,
+        suppressed_result: Optional[SendResult] = None) -> Optional[str]:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
@@ -4265,13 +4295,17 @@ class BasePlatformAdapter(ABC):
                 _ledger_id = getattr(event, "message_id", "")
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
+            terminal = suppressed_result is not None and suppressed_result.retry_suppressed is True
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
-            await asyncio.to_thread(mark_attempting, obligation_id)
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                retry_suppressed=terminal,
+                error=str(suppressed_result.error or "") if suppressed_result is not None else "")
+            if not terminal:
+                await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
             logger.debug("delivery ledger record failed", exc_info=True)
@@ -4292,6 +4326,9 @@ class BasePlatformAdapter(ABC):
                 await asyncio.to_thread(mark_delivered, obligation_id)
                 return
             error = str(getattr(result, "error", "") or "")
+            if getattr(result, "retry_suppressed", False) is True:
+                await asyncio.to_thread(mark_failed, obligation_id, error, retry_suppressed=True)
+                return
             await asyncio.to_thread(mark_failed, obligation_id, error)
             if is_reconnect_only(error):
                 redeliver = getattr(
@@ -4323,9 +4360,11 @@ class BasePlatformAdapter(ABC):
         _image_paths = [p for p, is_voice in media_files if not is_voice and _as_image(p)]
         _image_paths += [p for p in local_files if _as_image(p)]
         if _image_paths:
-            await self._send_image_batch(
+            result = await self._send_image_batch(
                 event, [(f"file://{_quote(p)}", "") for p in _image_paths], metadata, human_delay,
                 record_delivery)
+            if getattr(result, "retry_suppressed", False) is True:
+                return
         chat_id = event.source.chat_id
 
         async def _send_one(path: str, *, is_voice: bool, media_tag: bool) -> SendResult:
@@ -4340,7 +4379,7 @@ class BasePlatformAdapter(ABC):
                 result = await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
             else:
                 result = await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
-            if not result.success:
+            if not result.success and getattr(result, "retry_suppressed", False) is not True:
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)
                 await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=metadata)
@@ -4353,7 +4392,10 @@ class BasePlatformAdapter(ABC):
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
             try:
-                record_delivery(await _send_one(path, is_voice=is_voice, media_tag=media_tag))
+                result = await _send_one(path, is_voice=is_voice, media_tag=media_tag)
+                record_delivery(result)
+                if getattr(result, "retry_suppressed", False) is True:
+                    return
             except Exception as err:
                 record_delivery(SendResult(success=False, error=str(err)))
                 if media_tag:
@@ -4363,7 +4405,7 @@ class BasePlatformAdapter(ABC):
 
     async def _send_image_batch(
         self, event: MessageEvent, images: list, metadata: Dict[str, Any], human_delay: float,
-        record_delivery: Callable) -> None:
+        record_delivery: Callable) -> Optional[SendResult]:
         """Batch-send images; a failure is logged (never raised) so other attachments still go.
         The batch result feeds ``record_delivery`` so media-only turns report their real
         outcome instead of FAILURE."""
@@ -4375,27 +4417,35 @@ class BasePlatformAdapter(ABC):
             record_delivery(SendResult(success=False, error=str(batch_err)))
             return
         record_delivery(result)
+        return result
 
     async def send_final_ledgered(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
         reply_to: Optional[str], is_ephemeral_response: bool = False,
+        suppressed_result: Optional[SendResult] = None,
     ) -> "tuple[SendResult, BasePlatformAdapter]":
         """The delivery-ledger bracket every final text goes through, on the CURRENT transport
         (a reconnect may have replaced this adapter): record the obligation before the send,
         send with retry, finalize from the result — so a refused final (flood control, a dead
         transport) leaves a ledger row the boot sweep / runtime redelivery can act on. ``event``
         supplies the source and the ledger identity (``ledger_message_id`` or ``message_id``).
+        ``suppressed_result`` retains a previous policy failure without sending again, while
+        atomically recording the original final text as abandoned for diagnostics.
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
         delivery_adapter = self._final_delivery_adapter(event.source)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+            event, session_key, text_content, delivery_adapter, is_ephemeral_response,
+            suppressed_result=suppressed_result)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
-        result = await delivery_adapter._send_with_retry(
-            chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+        if suppressed_result is not None and suppressed_result.retry_suppressed is True:
+            result = suppressed_result
+        else:
+            result = await delivery_adapter._send_with_retry(
+                chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
@@ -4414,7 +4464,8 @@ class BasePlatformAdapter(ABC):
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
-            reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
+            reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response,
+            suppressed_result=getattr(event, "_delivery_retry_suppressed_result", None))
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
@@ -4451,7 +4502,9 @@ class BasePlatformAdapter(ABC):
         images, media_files, local_files = extracted.images, extracted.media_files, extracted.local_files
         if images:
             logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
-            await self._send_image_batch(event, images, metadata, human_delay, record_delivery)
+            result = await self._send_image_batch(event, images, metadata, human_delay, record_delivery)
+            if getattr(result, "retry_suppressed", False) is True:
+                return
         await self._deliver_media_attachments(
             event, media_files, local_files,
             force_document_attachments=extracted.force_document_attachments,
@@ -4562,13 +4615,16 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
-        delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        delivery_attempted = delivery_succeeded = delivery_retry_suppressed = False  # processing hook
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, delivery_retry_suppressed
             if result is not None:
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+                if getattr(result, "retry_suppressed", False) is True:
+                    delivery_retry_suppressed = True
+                    event._delivery_retry_suppressed_result = result
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
@@ -4578,6 +4634,9 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            # A queued chain may hand back the final of a newer event/turn. Refresh
+            # its delivery scope instead of reusing the first turn's terminal state.
+            _thread_metadata = _thread_metadata_for_event(event)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4592,6 +4651,9 @@ class BasePlatformAdapter(ABC):
                             session_key)
                 response = None
             if not response:
+                terminal = getattr(event, "_delivery_retry_suppressed_result", None)
+                if getattr(terminal, "retry_suppressed", False) is True:
+                    _record_delivery(terminal)
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
                 extracted = await self._extract_response_content(
@@ -4600,13 +4662,17 @@ class BasePlatformAdapter(ABC):
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
-                if self._wants_auto_tts(
-                        event, session_key, interrupt_event, text_content, media_files):
+                suppressed_result = getattr(event, "_delivery_retry_suppressed_result", None)
+                if (getattr(suppressed_result, "retry_suppressed", False) is not True
+                        and self._wants_auto_tts(
+                            event, session_key, interrupt_event, text_content, media_files)):
                     _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content)
                 # TTS plays before text; generated files are removed afterwards.
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):
                     try:
+                        if delivery_retry_suppressed:
+                            continue
                         _tts_caption_delivered |= await self._play_tts_file(
                             event, text_content, _tts_path, _tts_index == 0, _final_thread_metadata,
                             _record_delivery)
@@ -4632,12 +4698,16 @@ class BasePlatformAdapter(ABC):
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)
-                await self._deliver_attachments(
-                    event, extracted, _final_thread_metadata,
-                    anything_sent=delivery_attempted or _tts_caption_delivered,
-                    record_delivery=_record_delivery)
+                if getattr(suppressed_result, "retry_suppressed", False) is True:
+                    _record_delivery(suppressed_result)
+                if not delivery_retry_suppressed:
+                    await self._deliver_attachments(
+                        event, extracted, _final_thread_metadata,
+                        anything_sent=delivery_attempted or _tts_caption_delivered,
+                        record_delivery=_record_delivery)
             await self._release_turn_marker(event)
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = not delivery_retry_suppressed and (
+                delivery_succeeded if delivery_attempted else not bool(response))
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
