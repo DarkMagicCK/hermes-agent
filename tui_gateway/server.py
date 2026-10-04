@@ -2715,7 +2715,7 @@ def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | Non
     try:
         if db is not None:
             row = db.get_session(key) if hasattr(db, "get_session") else None
-            if row and row.get("cwd"):
+            if row and _resumable_stored_cwd(row.get("cwd"), profile_home):
                 # An ssh session's stored cwd is its workspace: explicit, so the remote terminal uses it instead of
                 # the profile's ~. Other backends keep main's semantics (resolved outside the sessions lock: I/O).
                 remote = _cwd_is_remote(profile_home)
@@ -2734,7 +2734,10 @@ def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | Non
                         _persist_session_cwd_and_schedule_git_meta(_sessions[sid], row["cwd"], db=db)
                     except Exception:
                         logger.debug("failed to enrich resumed session git metadata", exc_info=True)
-            elif hasattr(db, "update_session_cwd"):
+            elif not (row and row.get("cwd")) and hasattr(db, "update_session_cwd") and not _is_remote_launch_cwd(
+                _sessions.get(sid)
+            ):
+                # A stored cwd that was set aside (Hermes's own host tree) stays as stored: only an empty row is filled.
                 try:
                     _persist_session_cwd_and_schedule_git_meta(_sessions[sid], _sessions[sid]["cwd"], db=db)
                 except Exception:
