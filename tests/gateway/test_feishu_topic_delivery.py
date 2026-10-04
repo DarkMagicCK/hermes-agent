@@ -57,7 +57,7 @@ async def send_kind(adapter, kind, tmp_path, metadata, reply_to=None):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy", ["main_chat", "error_notice", "silent"])
+@pytest.mark.parametrize("policy", ["parent_chat", "error_notice", "silent"])
 @pytest.mark.parametrize("kind", ["text", "post", "status", "stream", "image", "file", "audio", "captioned_audio"])
 @pytest.mark.parametrize("failure", ["no_anchor", 230011, 231003, 99992402])
 async def test_topic_policy_is_shared_by_every_payload_and_never_recurses(adapter, tmp_path, policy, kind, failure):
@@ -68,8 +68,8 @@ async def test_topic_policy_is_shared_by_every_payload_and_never_recurses(adapte
     if failure != "no_anchor":
         metadata["reply_to_message_id"] = " om_old "
     result = await send_kind(adapter, kind, tmp_path, metadata)
-    assert result.success is (policy == "main_chat")
-    assert result.retry_suppressed is (policy != "main_chat")
+    assert result.success is (policy == "parent_chat")
+    assert result.retry_suppressed is (policy != "parent_chat")
     creates = adapter._client.im.v1.message.create.call_args_list
     assert len(creates) == (0 if policy == "silent" else 1)
     request = adapter._client.im.v1.message.list.call_args.args[0]
@@ -87,7 +87,7 @@ async def test_topic_policy_is_shared_by_every_payload_and_never_recurses(adapte
             assert all(word in diagnostic for word in ("ref=", "code=", "stage=", "oc_chat", "omt_topic", "app_id="))
             assert all(word not in diagnostic for word in ("ORIGINAL_SECRET", "raw error", "private_", "file_uploaded"))
             assert result.message_id is None  # never let streaming edit the diagnostic into original content
-    if policy != "main_chat":
+    if policy != "parent_chat":
         # Same turn, copied metadata: no repeated lookup, notice, media upload or outer plain fallback.
         adapter._client.im.v1.message.create.side_effect = RuntimeError("notice retry forbidden")
         again = await adapter._send_with_retry("oc_chat", "OTHER_SECRET", metadata=dict(metadata))
@@ -128,7 +128,7 @@ async def test_reanchor_uses_newest_candidates_excludes_failed_and_deleted_and_i
     adapter._client.im.v1.message.reply.reset_mock()
     adapter._client.im.v1.message.reply.side_effect = lambda request: failed(231003)
     result = await adapter.send("oc_chat", "bounded", metadata={"thread_id": "omt_topic"})
-    assert result.success  # main_chat default, after exactly three candidates
+    assert result.success  # parent_chat default, after exactly three candidates
     assert adapter._client.im.v1.message.reply.call_count == 3
     assert adapter._client.im.v1.message.create.call_count == 1
 
@@ -169,7 +169,7 @@ async def test_unrelated_failures_never_broaden_recipient(adapter, monkeypatch, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("notice_failure", ["response", "exception"])
-async def test_failed_notice_and_long_replies_stay_terminal_without_losing_main_chat_chunks(adapter, notice_failure):
+async def test_failed_notice_and_long_replies_stay_terminal_without_losing_parent_chat_chunks(adapter, notice_failure):
     adapter._topic_delivery_fallback = "error_notice"
     if notice_failure == "response":
         adapter._client.im.v1.message.create.return_value = failed(99991663)
@@ -181,7 +181,7 @@ async def test_failed_notice_and_long_replies_stay_terminal_without_losing_main_
     assert adapter._client.im.v1.message.create.call_count == 1
     assert adapter._client.im.v1.message.list.call_count == 1
 
-    adapter._topic_delivery_fallback = "main_chat"
+    adapter._topic_delivery_fallback = "parent_chat"
     adapter._client.im.v1.message.create.reset_mock()
     adapter._client.im.v1.message.create.side_effect = None
     adapter._client.im.v1.message.create.return_value = ok(message_id="om_parent")
@@ -207,7 +207,7 @@ async def test_concurrent_outputs_share_one_notice_but_other_topics_and_redirect
     assert other.success
     assert adapter._client.im.v1.message.reply.call_args.args[0].message_id == "om_foreground"
 
-    adapter._topic_delivery_fallback = "main_chat"
+    adapter._topic_delivery_fallback = "parent_chat"
     md = {"thread_id": "omt_redirect"}
     await adapter.send("oc_chat", "before", reply_to="om_initial", metadata=md)
     await adapter.send("oc_chat", "after redirect", reply_to="om_redirected", metadata=md)
@@ -240,7 +240,7 @@ async def test_independent_identical_sends_have_distinct_uuids_and_partial_failu
 @pytest.mark.asyncio
 @pytest.mark.parametrize("seed_state", [False, True])
 @pytest.mark.parametrize("initial_anchor", [None, "om_old"])
-async def test_stream_overflow_after_main_chat_fallback_never_creates_a_new_topic(adapter, seed_state, initial_anchor):
+async def test_stream_overflow_after_parent_chat_fallback_never_creates_a_new_topic(adapter, seed_state, initial_anchor):
     from gateway.stream_consumer import GatewayStreamConsumer
 
     metadata = {"thread_id": "omt_original"}
@@ -260,7 +260,7 @@ async def test_stream_overflow_after_main_chat_fallback_never_creates_a_new_topi
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy", ["main_chat", "error_notice", "silent"])
+@pytest.mark.parametrize("policy", ["parent_chat", "error_notice", "silent"])
 @pytest.mark.parametrize("lookup_failure", [99991400, 99991663, "network"])
 async def test_history_lookup_failure_uses_policy_without_treating_it_as_a_send_failure(adapter, monkeypatch, policy, lookup_failure):
     adapter._topic_delivery_fallback = policy
@@ -269,8 +269,8 @@ async def test_history_lookup_failure_uses_policy_without_treating_it_as_a_send_
     else:
         adapter._client.im.v1.message.list.return_value = failed(lookup_failure)
     result = await adapter.send("oc_chat", "ORIGINAL_SECRET", metadata={"thread_id": "omt_topic"})
-    assert result.success is (policy == "main_chat")
-    assert result.retry_suppressed is (policy != "main_chat")
+    assert result.success is (policy == "parent_chat")
+    assert result.retry_suppressed is (policy != "parent_chat")
     assert adapter._client.im.v1.message.list.call_count == 1
     assert adapter._client.im.v1.message.create.call_count == int(policy != "silent")
     adapter._client.im.v1.message.reply.assert_not_called()
@@ -300,7 +300,7 @@ async def test_bare_send_timeout_is_not_replayed_as_plaintext_and_disconnected_a
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy", ["main_chat", "error_notice", "silent"])
+@pytest.mark.parametrize("policy", ["parent_chat", "error_notice", "silent"])
 @pytest.mark.parametrize("code", [230011, 99991663])
 async def test_silent_policy_cleans_processing_badge_without_exposing_failure_reaction(adapter, policy, code):
     from unittest.mock import AsyncMock
@@ -327,7 +327,7 @@ async def test_silent_policy_cleans_processing_badge_without_exposing_failure_re
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [99991663, "timeout"])
-async def test_failed_main_chat_fallback_is_honest_and_never_reenters_topic_recovery(adapter, monkeypatch, failure):
+async def test_failed_parent_chat_fallback_is_honest_and_never_reenters_topic_recovery(adapter, monkeypatch, failure):
     async def no_sleep(_):
         pass
     monkeypatch.setattr("plugins.platforms.feishu.adapter_delivery.asyncio.sleep", no_sleep)

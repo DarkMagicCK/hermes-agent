@@ -229,14 +229,14 @@ async def test_poststream_media_shares_event_scope_and_policy_stop_suppresses_fo
     source = _source()
     event = MessageEvent(text="question", source=source, message_id="om_question")
     state = runner._event_thread_metadata(event, source)["_feishu_topic_delivery"]
-    state["destination"] = "main_chat"
+    state["destination"] = "parent_chat"
     terminal = _terminal()
 
     async def media_delivery(response, received_event, received_adapter, *, thread_metadata):
         assert received_event is event
         assert received_adapter is adapter
         assert thread_metadata["_feishu_topic_delivery"] is state
-        assert state["destination"] == "main_chat"
+        assert state["destination"] == "parent_chat"
         state["terminal"] = terminal
 
     runner._deliver_media_from_response = AsyncMock(side_effect=media_delivery)

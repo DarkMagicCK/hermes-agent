@@ -116,7 +116,7 @@ async def test_multipart_voice_stops_only_for_terminal_policy(platform, outcome)
     event.source.platform = platform
     metadata = _thread_metadata_for_event(event)
     if platform == Platform.FEISHU:
-        metadata["_feishu_topic_delivery"]["destination"] = "main_chat"
+        metadata["_feishu_topic_delivery"]["destination"] = "parent_chat"
 
     await runner._deliver_voice_reply(event, ["first.ogg", "second.ogg"])
 
@@ -134,7 +134,7 @@ async def test_multipart_voice_stops_only_for_terminal_policy(platform, outcome)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy", ["main_chat", "error_notice", "silent"])
+@pytest.mark.parametrize("policy", ["parent_chat", "error_notice", "silent"])
 @pytest.mark.parametrize("text_first", [False, True])
 async def test_auto_voice_and_final_text_share_feishu_policy_on_the_wire(tmp_path, policy, text_first):
     from unittest.mock import Mock
@@ -176,9 +176,9 @@ async def test_auto_voice_and_final_text_share_feishu_policy_on_the_wire(tmp_pat
     assert wire.reply.call_count == 1
     assert wire.list.call_count == 1
     state = metadata["_feishu_topic_delivery"]
-    if policy == "main_chat":
+    if policy == "parent_chat":
         assert final.success
-        assert state["destination"] == "main_chat"
+        assert state["destination"] == "parent_chat"
         assert upload.call_count == 2
         assert wire.create.call_count == 3 + int(text_first)
     else:

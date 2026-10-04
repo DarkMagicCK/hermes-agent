@@ -319,7 +319,7 @@ class FeishuAdapterSettings:
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
-    topic_delivery_fallback: str = "main_chat"
+    topic_delivery_fallback: str = "parent_chat"
 
 
 @dataclass
@@ -1297,6 +1297,7 @@ class FeishuAdapter(FeishuTopicDeliveryMixin, BasePlatformAdapter):
     # --- Lifecycle — init / settings / connect / disconnect ---
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.FEISHU)
+        self._topic_profile_home = get_hermes_home()
         self._settings = self._load_settings(config.extra or {})
         self._apply_settings(self._settings)
         self._client: Optional[Any] = None
@@ -1385,9 +1386,9 @@ class FeishuAdapter(FeishuTopicDeliveryMixin, BasePlatformAdapter):
             allow_bots = "none"
 
         topic_delivery_fallback = _extra_or_secret(
-            "topic_delivery_fallback", "FEISHU_TOPIC_DELIVERY_FALLBACK", "main_chat").lower()
-        if topic_delivery_fallback not in {"main_chat", "error_notice", "silent"}:
-            raise ValueError("Feishu topic_delivery_fallback must be main_chat, error_notice, or silent")
+            "topic_delivery_fallback", "FEISHU_TOPIC_DELIVERY_FALLBACK", "parent_chat").lower()
+        if topic_delivery_fallback not in {"parent_chat", "parent_then_home", "error_notice", "silent"}:
+            raise ValueError("Feishu topic_delivery_fallback must be parent_chat, parent_then_home, error_notice, or silent")
 
         allow_all_dm = any(
             _secret(var).lower() in {"true", "1", "yes"} for var in ("FEISHU_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS")
