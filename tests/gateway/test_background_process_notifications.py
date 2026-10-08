@@ -451,7 +451,7 @@ async def test_inject_watch_notification_drops_stale_trigger_reply_anchor(monkey
     # Routing provenance is untouched: the notification still lands in the origin topic.
     assert synth_event.source.thread_id == "24296"
     # The derived final-reply anchor is empty on every platform branch.
-    from gateway.platforms.base import _reply_anchor_for_event
+    from gateway.platforms.base_thread_metadata import _reply_anchor_for_event
     assert _reply_anchor_for_event(synth_event) is None
     # The original id survives for debugging only.
     assert synth_event.metadata["original_trigger_message_id"] == "777"

@@ -50,137 +50,334 @@ def _terminal():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", [
-    "retry", "retry_after_transient", "retry_notice_terminal", "ordinary_retry", "ordinary_fallback",
-    "stream_first", "stream_commentary", "stream_chunk", "stream_flood",
-    "stream_fresh", "stream_edit", "media_file", "media_images", "poststream_media",
-    "status", "approval", "media_caption", "queued_media", "ambiguous_timeout", "stream_scope",
-])
-async def test_only_explicit_terminal_outcomes_stop_later_delivery(path, tmp_path, monkeypatch):
+async def test_terminal_delivery_retry(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    result = await adapter._send_with_retry('chat', 'original', base_delay=0, max_retries=0 if 'retry' == 'retry_notice_terminal' else 2)
+    assert result is terminal and (not result.success)
+    assert adapter.send.await_count == (2 if 'retry' in {'retry_after_transient', 'retry_notice_terminal'} else 1)
+    assert sleep.await_count == ('retry' == 'retry_after_transient')
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_retry_after_transient(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    adapter.send.side_effect = [SendResult(False, error='connection reset', retryable=True), terminal]
+    result = await adapter._send_with_retry('chat', 'original', base_delay=0, max_retries=0 if 'retry_after_transient' == 'retry_notice_terminal' else 2)
+    assert result is terminal and (not result.success)
+    assert adapter.send.await_count == (2 if 'retry_after_transient' in {'retry_after_transient', 'retry_notice_terminal'} else 1)
+    assert sleep.await_count == ('retry_after_transient' == 'retry_after_transient')
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_retry_notice_terminal(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    adapter.send.side_effect = [SendResult(False, error='connection reset', retryable=True), terminal]
+    result = await adapter._send_with_retry('chat', 'original', base_delay=0, max_retries=0 if 'retry_notice_terminal' == 'retry_notice_terminal' else 2)
+    assert result is terminal and (not result.success)
+    assert adapter.send.await_count == (2 if 'retry_notice_terminal' in {'retry_after_transient', 'retry_notice_terminal'} else 1)
+    assert sleep.await_count == ('retry_notice_terminal' == 'retry_after_transient')
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_ordinary_retry(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    adapter.send.side_effect = [SendResult(False, error='connection reset', retryable=True), SendResult(True)]
+    result = await adapter._send_with_retry('chat', 'original', base_delay=0, max_retries=0 if 'ordinary_retry' == 'retry_notice_terminal' else 2)
+    assert result.success and (not result.retry_suppressed)
+    assert adapter.send.await_count == 2
+    assert sleep.await_count == ('ordinary_retry' == 'ordinary_retry')
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_ordinary_fallback(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    adapter.send.side_effect = [SendResult(False, error='bad markup'), SendResult(True)]
+    result = await adapter._send_with_retry('chat', 'original', base_delay=0, max_retries=0 if 'ordinary_fallback' == 'retry_notice_terminal' else 2)
+    assert result.success and (not result.retry_suppressed)
+    assert adapter.send.await_count == 2
+    assert sleep.await_count == ('ordinary_fallback' == 'ordinary_retry')
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_stream_first(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    consumer = GatewayStreamConsumer(adapter, 'chat')
+    assert not await consumer._send_or_edit('original')
+    assert consumer.retry_suppressed_result is terminal
+    sends, edits = (adapter.send.await_count, adapter.edit_message.await_count)
+    consumer._reset_message_state()
+    consumer._accumulated = 'original plus more'
+    await consumer._send_or_edit('original plus more', finalize=True)
+    await consumer._send_commentary('later commentary')
+    await consumer._send_new_chunk('later chunk', None)
+    await consumer._send_fallback_final('original plus more')
+    await consumer._flush_segment_tail_on_edit_failure()
+    assert adapter.send.await_count == sends
+    assert adapter.edit_message.await_count == edits
+    assert not consumer.final_response_sent and (not consumer.final_content_delivered)
+    sleep.assert_not_awaited()
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_stream_commentary(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    consumer = GatewayStreamConsumer(adapter, 'chat')
+    assert not await consumer._send_commentary('original')
+    assert consumer.retry_suppressed_result is terminal
+    sends, edits = (adapter.send.await_count, adapter.edit_message.await_count)
+    consumer._reset_message_state()
+    consumer._accumulated = 'original plus more'
+    await consumer._send_or_edit('original plus more', finalize=True)
+    await consumer._send_commentary('later commentary')
+    await consumer._send_new_chunk('later chunk', None)
+    await consumer._send_fallback_final('original plus more')
+    await consumer._flush_segment_tail_on_edit_failure()
+    assert adapter.send.await_count == sends
+    assert adapter.edit_message.await_count == edits
+    assert not consumer.final_response_sent and (not consumer.final_content_delivered)
+    sleep.assert_not_awaited()
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_stream_chunk(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    consumer = GatewayStreamConsumer(adapter, 'chat')
+    assert await consumer._send_new_chunk('original', None) is None
+    assert consumer.retry_suppressed_result is terminal
+    sends, edits = (adapter.send.await_count, adapter.edit_message.await_count)
+    consumer._reset_message_state()
+    consumer._accumulated = 'original plus more'
+    await consumer._send_or_edit('original plus more', finalize=True)
+    await consumer._send_commentary('later commentary')
+    await consumer._send_new_chunk('later chunk', None)
+    await consumer._send_fallback_final('original plus more')
+    await consumer._flush_segment_tail_on_edit_failure()
+    assert adapter.send.await_count == sends
+    assert adapter.edit_message.await_count == edits
+    assert not consumer.final_response_sent and (not consumer.final_content_delivered)
+    sleep.assert_not_awaited()
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_stream_flood(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    consumer = GatewayStreamConsumer(adapter, 'chat')
+    assert await consumer._send_with_flood_retry(content='original', retry_log='retry %s') is terminal
+    assert consumer.retry_suppressed_result is terminal
+    sends, edits = (adapter.send.await_count, adapter.edit_message.await_count)
+    consumer._reset_message_state()
+    consumer._accumulated = 'original plus more'
+    await consumer._send_or_edit('original plus more', finalize=True)
+    await consumer._send_commentary('later commentary')
+    await consumer._send_new_chunk('later chunk', None)
+    await consumer._send_fallback_final('original plus more')
+    await consumer._flush_segment_tail_on_edit_failure()
+    assert adapter.send.await_count == sends
+    assert adapter.edit_message.await_count == edits
+    assert not consumer.final_response_sent and (not consumer.final_content_delivered)
+    sleep.assert_not_awaited()
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_stream_fresh(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    consumer = GatewayStreamConsumer(adapter, 'chat')
+    consumer._message_id = 'preview'
+    assert not await consumer._try_fresh_final('original')
+    assert consumer.retry_suppressed_result is terminal
+    sends, edits = (adapter.send.await_count, adapter.edit_message.await_count)
+    consumer._reset_message_state()
+    consumer._accumulated = 'original plus more'
+    await consumer._send_or_edit('original plus more', finalize=True)
+    await consumer._send_commentary('later commentary')
+    await consumer._send_new_chunk('later chunk', None)
+    await consumer._send_fallback_final('original plus more')
+    await consumer._flush_segment_tail_on_edit_failure()
+    assert adapter.send.await_count == sends
+    assert adapter.edit_message.await_count == edits
+    assert not consumer.final_response_sent and (not consumer.final_content_delivered)
+    sleep.assert_not_awaited()
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_stream_edit(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    consumer = GatewayStreamConsumer(adapter, 'chat')
+    consumer._message_id = 'preview'
+    assert not await consumer._send_or_edit('original', finalize=True)
+    assert consumer.retry_suppressed_result is terminal
+    sends, edits = (adapter.send.await_count, adapter.edit_message.await_count)
+    consumer._reset_message_state()
+    consumer._accumulated = 'original plus more'
+    await consumer._send_or_edit('original plus more', finalize=True)
+    await consumer._send_commentary('later commentary')
+    await consumer._send_new_chunk('later chunk', None)
+    await consumer._send_fallback_final('original plus more')
+    await consumer._flush_segment_tail_on_edit_failure()
+    assert adapter.send.await_count == sends
+    assert adapter.edit_message.await_count == edits
+    assert not consumer.final_response_sent and (not consumer.final_content_delivered)
+    sleep.assert_not_awaited()
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_media_file(tmp_path, monkeypatch):
     terminal = _terminal()
     adapter = _Adapter(terminal)
     event = _event()
     sleep = AsyncMock()
-    monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", sleep)
-    if path == "ambiguous_timeout":
-        adapter.send.return_value = SendResult(False, error="TimeoutError: ")
-        result = await adapter._send_with_retry("chat", "original")
-        assert not result.success and not result.retry_suppressed
-        adapter.send.assert_awaited_once()
-        sleep.assert_not_awaited()
-        return
-    if path == "stream_scope":
-        adapter.platform = Platform.FEISHU
-        metadata = {"thread_id": "topic"}
-        first = GatewayStreamConsumer(adapter, "chat", metadata=metadata)
-        second = GatewayStreamConsumer(adapter, "chat", metadata=metadata)
-        one = first._metadata_for_send()
-        one["_feishu_topic_delivery"]["terminal"] = terminal
-        assert first._metadata_for_send()["_feishu_topic_delivery"]["terminal"] is terminal
-        assert second._metadata_for_send()["_feishu_topic_delivery"] == {}
-        assert "_feishu_topic_delivery" not in metadata
-        return
-    if path.startswith("retry") or path.startswith("ordinary"):
-        if path in {"retry_after_transient", "retry_notice_terminal"}:
-            adapter.send.side_effect = [SendResult(False, error="connection reset", retryable=True), terminal]
-        elif path == "ordinary_retry":
-            adapter.send.side_effect = [SendResult(False, error="connection reset", retryable=True), SendResult(True)]
-        elif path == "ordinary_fallback":
-            adapter.send.side_effect = [SendResult(False, error="bad markup"), SendResult(True)]
-        result = await adapter._send_with_retry(
-            "chat", "original", base_delay=0, max_retries=0 if path == "retry_notice_terminal" else 2)
-        if path.startswith("ordinary"):
-            assert result.success and not result.retry_suppressed
-            assert adapter.send.await_count == 2
-            assert sleep.await_count == (path == "ordinary_retry")
-        else:
-            assert result is terminal and not result.success
-            assert adapter.send.await_count == (2 if path in {"retry_after_transient", "retry_notice_terminal"} else 1)
-            assert sleep.await_count == (path == "retry_after_transient")
-        return
-    if path.startswith("stream"):
-        consumer = GatewayStreamConsumer(adapter, "chat")
-        if path == "stream_first":
-            assert not await consumer._send_or_edit("original")
-        elif path == "stream_commentary":
-            assert not await consumer._send_commentary("original")
-        elif path == "stream_chunk":
-            assert await consumer._send_new_chunk("original", None) is None
-        elif path == "stream_flood":
-            assert await consumer._send_with_flood_retry(content="original", retry_log="retry %s") is terminal
-        elif path == "stream_fresh":
-            consumer._message_id = "preview"
-            assert not await consumer._try_fresh_final("original")
-        else:
-            consumer._message_id = "preview"
-            assert not await consumer._send_or_edit("original", finalize=True)
-        assert consumer.retry_suppressed_result is terminal
-        sends, edits = adapter.send.await_count, adapter.edit_message.await_count
-        consumer._reset_message_state()  # a tool boundary must not revive the terminal turn
-        consumer._accumulated = "original plus more"
-        await consumer._send_or_edit("original plus more", finalize=True)
-        await consumer._send_commentary("later commentary")
-        await consumer._send_new_chunk("later chunk", None)
-        await consumer._send_fallback_final("original plus more")
-        await consumer._flush_segment_tail_on_edit_failure()
-        assert adapter.send.await_count == sends
-        assert adapter.edit_message.await_count == edits
-        assert not consumer.final_response_sent and not consumer.final_content_delivered
-        sleep.assert_not_awaited()
-        return
-    if path == "queued_media":
-        from gateway.run import GatewayRunner
-        attachment = tmp_path / "report.pdf"
-        attachment.write_bytes(b"attachment")
-        adapter.send.return_value = SendResult(True, message_id="body")
-        runner = object.__new__(GatewayRunner)
-        result = await runner._deliver_queued_first_response(
-            f"answer\nMEDIA: {attachment}", event.source, adapter)
-        assert result.success is False and result.retry_suppressed
-        assert result._text_already_delivered is True
-        assert not hasattr(terminal, "_text_already_delivered")
-        adapter.send.assert_awaited_once()
-        adapter.send_document.assert_awaited_once()
-        return
-    if path == "media_caption":
-        adapter.warning_notifications_enabled = Mock(return_value=False)
-        result = await adapter.emit_media_warning("chat", "media unavailable", caption="caption")
-        assert result is terminal
-        adapter.send.assert_awaited_once()
-        return
-    if path == "status":
-        from gateway.run import _send_or_update_status_coro
-        result = await _send_or_update_status_coro(
-            adapter, "chat", "status", "original", {"_feishu_topic_delivery": {"terminal": terminal}})
-        assert result is terminal
-    elif path == "approval":
-        from gateway.run import _approval_send_outcome
-        assert _approval_send_outcome(SimpleNamespace(result=lambda **kwargs: terminal), 1) == "suppressed"
-    elif path == "media_images":
-        result = await adapter.send_multiple_images("chat", [("https://example.com/a.png", ""),
-                                                             ("https://example.com/b.png", "")])
-        assert result is terminal
-        adapter.send_image.assert_awaited_once()
-    elif path == "media_file":
-        notices = adapter._notify_media_delivery_failure = AsyncMock()
-        outcomes = []
-        await adapter._deliver_media_attachments(
-            event, [("one.pdf", False), ("two.pdf", False)], [],
-            force_document_attachments=False, human_delay=0, metadata={}, record_delivery=outcomes.append)
-        assert outcomes == [terminal]
-        adapter.send_document.assert_awaited_once()
-        notices.assert_not_awaited()
-    else:
-        from gateway.run import GatewayRunner
-        files = [tmp_path / "one.pdf", tmp_path / "two.pdf"]
-        for file in files:
-            file.write_bytes(b"attachment")
-        runner = object.__new__(GatewayRunner)
-        result = await runner._deliver_media_from_response(
-            "\n".join(f"MEDIA: {file}" for file in files), event, adapter, thread_metadata={})
-        assert result is terminal
-        adapter.send_document.assert_awaited_once()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    notices = adapter._notify_media_delivery_failure = AsyncMock()
+    outcomes = []
+    await adapter._deliver_media_attachments(event, [('one.pdf', False), ('two.pdf', False)], [], force_document_attachments=False, human_delay=0, metadata={}, record_delivery=outcomes.append)
+    assert outcomes == [terminal]
+    adapter.send_document.assert_awaited_once()
+    notices.assert_not_awaited()
     adapter.send.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_media_images(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    result = await adapter.send_multiple_images('chat', [('https://example.com/a.png', ''), ('https://example.com/b.png', '')])
+    assert result is terminal
+    adapter.send_image.assert_awaited_once()
+    adapter.send.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_poststream_media(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    event = _event()
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    from gateway.run import GatewayRunner
+    files = [tmp_path / 'one.pdf', tmp_path / 'two.pdf']
+    for file in files:
+        file.write_bytes(b'attachment')
+    runner = object.__new__(GatewayRunner)
+    result = await runner._deliver_media_from_response('\n'.join((f'MEDIA: {file}' for file in files)), event, adapter, thread_metadata={})
+    assert result is terminal
+    adapter.send_document.assert_awaited_once()
+    adapter.send.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_status(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    from gateway.run import _send_or_update_status_coro
+    result = await _send_or_update_status_coro(adapter, 'chat', 'status', 'original', {'_feishu_topic_delivery': {'terminal': terminal}})
+    assert result is terminal
+    adapter.send.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_approval(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    from gateway.run import _approval_send_outcome
+    assert _approval_send_outcome(SimpleNamespace(result=lambda **kwargs: terminal), 1) == 'suppressed'
+    adapter.send.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_media_caption(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    adapter.warning_notifications_enabled = Mock(return_value=False)
+    result = await adapter.emit_media_warning('chat', 'media unavailable', caption='caption')
+    assert result is terminal
+    adapter.send.assert_awaited_once()
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_queued_media(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    event = _event()
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    from gateway.run import GatewayRunner
+    attachment = tmp_path / 'report.pdf'
+    attachment.write_bytes(b'attachment')
+    adapter.send.return_value = SendResult(True, message_id='body')
+    runner = object.__new__(GatewayRunner)
+    result = await runner._deliver_queued_first_response(f'answer\nMEDIA: {attachment}', event.source, adapter)
+    assert result.success is False and result.retry_suppressed
+    assert result._text_already_delivered is True
+    assert not hasattr(terminal, '_text_already_delivered')
+    adapter.send.assert_awaited_once()
+    adapter.send_document.assert_awaited_once()
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_ambiguous_timeout(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    adapter.send.return_value = SendResult(False, error='TimeoutError: ')
+    result = await adapter._send_with_retry('chat', 'original')
+    assert not result.success and (not result.retry_suppressed)
+    adapter.send.assert_awaited_once()
+    sleep.assert_not_awaited()
+    return
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_stream_scope(tmp_path, monkeypatch):
+    terminal = _terminal()
+    adapter = _Adapter(terminal)
+    sleep = AsyncMock()
+    monkeypatch.setattr('gateway.platforms.base.asyncio.sleep', sleep)
+    adapter.platform = Platform.FEISHU
+    metadata = {'thread_id': 'topic'}
+    first = GatewayStreamConsumer(adapter, 'chat', metadata=metadata)
+    second = GatewayStreamConsumer(adapter, 'chat', metadata=metadata)
+    one = first._metadata_for_send()
+    one['_feishu_topic_delivery']['terminal'] = terminal
+    assert first._metadata_for_send()['_feishu_topic_delivery']['terminal'] is terminal
+    assert second._metadata_for_send()['_feishu_topic_delivery'] == {}
+    assert '_feishu_topic_delivery' not in metadata
+    return
 
 
 @pytest.mark.asyncio

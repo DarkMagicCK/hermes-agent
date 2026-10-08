@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import SendResult, _thread_metadata_for_event
+from gateway.platforms.base import SendResult
+from gateway.platforms.base_thread_metadata import _thread_metadata_for_event
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.run_turn_runner import TurnRunner

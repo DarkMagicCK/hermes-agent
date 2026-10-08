@@ -305,7 +305,7 @@ async def test_bare_send_timeout_is_not_replayed_as_plaintext_and_disconnected_a
 async def test_silent_policy_cleans_processing_badge_without_exposing_failure_reaction(adapter, policy, code):
     from unittest.mock import AsyncMock
     from gateway.config import Platform
-    from gateway.platforms.base import _thread_metadata_for_event
+    from gateway.platforms.base_thread_metadata import _thread_metadata_for_event
     from gateway.platforms.event import MessageEvent, ProcessingOutcome
     from gateway.session import SessionSource
 
@@ -348,3 +348,41 @@ async def test_failed_parent_chat_fallback_is_honest_and_never_reenters_topic_re
         assert "Feishu topic delivery failed" not in request.request_body.content
     if failure == "timeout":
         assert len({c.args[0].request_body.uuid for c in creates}) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["home", "lookup", "notice"])
+async def test_topic_exception_logs_keep_traceback_but_redact_sdk_text(adapter, monkeypatch, caplog, boundary):
+    secret = "PRIVATE_PAYLOAD credential=not-for-logs"
+
+    def fail(*args, **kwargs):
+        try:
+            raise ValueError(secret)
+        except ValueError as cause:
+            raise RuntimeError(secret) from cause
+
+    state = {}
+    if boundary == "home":
+        adapter._topic_delivery_fallback = "parent_then_home"
+        adapter._client.im.v1.message.create.return_value = failed(232009)
+        monkeypatch.setattr(adapter, "_resolve_topic_home", fail)
+        result = await adapter._send_to_topic_fallback(
+            chat_id="oc_chat", msg_type="text", payload="body", state=state, metadata={})
+    elif boundary == "lookup":
+        adapter._client.im.v1.message.list.side_effect = fail
+        result = await adapter._list_topic_reply_anchors("omt_topic", set())
+    else:
+        adapter._topic_delivery_fallback = "error_notice"
+        adapter._client.im.v1.message.create.side_effect = fail
+        result = await adapter._apply_topic_delivery_fallback(
+            chat_id="oc_chat", thread_id="omt_topic", anchor=None, msg_type="text", payload="body",
+            state=state, code="missing_anchor", stage="resolve_anchor", metadata={})
+    assert not result.success
+    assert secret not in str(result.error)
+    assert secret not in caplog.text
+    records = [record for record in caplog.records if record.exc_info]
+    assert len(records) == 1
+    _, sanitized, traceback = records[0].exc_info
+    assert str(sanitized) == "RuntimeError"
+    assert sanitized.__context__ is None and sanitized.__cause__ is None
+    assert traceback is not None

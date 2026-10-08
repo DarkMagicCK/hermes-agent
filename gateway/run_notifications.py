@@ -21,9 +21,9 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, cast
 
 from agent.i18n import t
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
-from gateway.platforms.base import (
-    BasePlatformAdapter, SendResult, _mark_notify_metadata,
-)
+from gateway.run_notifications_process import GatewayProcessNotificationMixin
+from gateway.platforms import base as platform_base, base_thread_metadata
+from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
@@ -80,8 +80,6 @@ def _update_output_tail(output: str, limit: int) -> str:
 
 
 _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
-# Routing fields copied verbatim from a process watcher onto its synthetic completion event.
-_WATCHER_ROUTE_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id", "user_name")
 _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 # Storage causes that clear on their own (one session's lease/compression, not the store): the
 # home-channel notice appends the operator restart tail for every OTHER cause.
@@ -129,7 +127,7 @@ def _raw_process_event_session_id(evt: dict) -> str:
     return str(evt.get("origin_session_id") or session_key or "").strip()
 
 
-class GatewayNotificationsMixin:
+class GatewayNotificationsMixin(GatewayProcessNotificationMixin):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
     # Coalescing keys: process completions (short-window fan-in) and async delegations (+ parent session).
@@ -369,9 +367,9 @@ class GatewayNotificationsMixin:
         with _log_suppressed(logging.WARNING, "Post-stream media extraction failed: %s"):
             # Capture [[as_document]] before extract_media strips it: images then go via send_document.
             force_document_attachments = "[[as_document]]" in response
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+            from gateway.platforms.base import should_send_media_as_audio
             media_files, cleaned = adapter.extract_media(response)
-            media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            media_files = platform_base.BasePlatformAdapter.filter_media_delivery_paths(media_files)
             # Strip image URLs (parity with the non-streaming chain); no extract_local_files here.
             # Do NOT deduplicate explicit MEDIA tags against prior turns here (#73771). This rescan is
             # already EXPLICIT-ONLY (see docstring): a MEDIA: directive in the final streamed reply is the
@@ -538,10 +536,10 @@ class GatewayNotificationsMixin:
         (Telegram forum topics, Slack reaction handoffs) and so cannot identify the turn; with no
         inbound id the ledger falls back to the event's own (empty) message id. Adapters without
         the base contract and sends without a session key keep the plain send."""
-        if session_key and isinstance(adapter, BasePlatformAdapter):
+        if session_key and isinstance(adapter, platform_base.BasePlatformAdapter):
             result, _ = await adapter.send_final_ledgered(
                 MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
-                session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id,
+                session_key, text_content, base_thread_metadata._mark_notify_metadata(metadata), reply_to=event_message_id,
                 **({"suppressed_result": suppressed_result}
                    if getattr(suppressed_result, "retry_suppressed", False) is True else {}))
         elif getattr(suppressed_result, "retry_suppressed", False) is True:
@@ -1978,24 +1976,6 @@ class GatewayNotificationsMixin:
                         logger.error("Async delegation injection error: %s", e)
             await asyncio.sleep(interval)
 
-    @staticmethod
-    def _redacted_output_tail(session, limit: int) -> str:
-        """Last ``limit`` chars of process output through the secret redactors (unconditional floor)."""
-        from gateway.run import _redact_gateway_user_facing_secrets
-        from tools.ansi_strip import strip_ansi
-        from tools.process_registry import transform_process_output
-        new_output = strip_ansi(session.output_buffer[-limit:]) if session.output_buffer else ""
-        if new_output:
-            from agent.redact import redact_terminal_output
-            _command = getattr(session, "command", "") or ""
-            new_output = transform_process_output(new_output, command=_command, returncode=session.exit_code,
-                                                  task_id=getattr(session, "task_id", "") or "")
-            new_output = redact_terminal_output(new_output, _command)
-            # redact_terminal_output() is unforced (raw when security.redact_secrets is off); this goes
-            # straight to the adapter, so apply the same unconditional floor as agent-notify.
-            new_output = _redact_gateway_user_facing_secrets(new_output)
-        return new_output
-
     async def _launching_turn_active(self, platform_name: str, watcher: dict) -> bool:
         """Whether the session that launched *watcher*'s process is still inside a turn on its
         adapter (``_active_sessions`` is the base adapter's busy guard)."""
@@ -2026,69 +2006,6 @@ class GatewayNotificationsMixin:
                     metadata=_non_conversational_metadata(send_meta, platform=platform_name),
                     **send_kwargs,
                 )
-
-    @staticmethod
-    def _build_process_completion_event(watcher: dict, session, session_id: str) -> dict:
-        """Build the synthetic ``completion`` event for an agent-notify watcher."""
-        from gateway.run import _redact_gateway_user_facing_secrets
-        from agent.redact import redact_terminal_output
-        from tools.ansi_strip import strip_ansi
-        from tools.process_registry import transform_process_output
-        _command = getattr(session, "command", "") or ""
-        _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
-        _raw = transform_process_output(_raw, command=_command, returncode=session.exit_code,
-                                        task_id=getattr(session, "task_id", "") or "") if _raw else _raw
-        _raw = redact_terminal_output(_raw, _command)
-        # Keep the last ~2000 chars snapped to a line boundary, with a marker when cut.
-        _LIMIT = 2000
-        # Truncate at line boundaries so notifications never start mid-line (fixes #23284). Keep the last
-        # ~2000 chars but snap to the nearest preceding newline, then prepend a truncation marker when
-        # output was cut.
-        if len(_raw) > _LIMIT:
-            _tail = _raw[-_LIMIT:]
-            _nl = _tail.find("\n")
-            _tail = _tail[_nl + 1:] if _nl != -1 else _tail
-            _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
-        else:
-            _out = _raw
-        return {
-            "type": "completion",
-            "session_id": session_id,
-            **{k: watcher.get(k, "") for k in _WATCHER_ROUTE_FIELDS},
-            "message_id": str(watcher.get("message_id") or "").strip() or None,
-            "started_at": getattr(session, "started_at", None),
-            "command": _redact_gateway_user_facing_secrets(_command),
-            "exit_code": session.exit_code,
-            "completion_reason": getattr(session, "completion_reason", "exited"),
-            "termination_source": getattr(session, "termination_source", ""),
-            "output": _redact_gateway_user_facing_secrets(_out),
-            # Spawning session-db id: lets pre-flight drop this completion if the user /new'd first.
-            "parent_session_id": (
-                watcher.get("parent_session_id") or getattr(session, "parent_session_id", "") or ""
-            ),
-        }
-
-    def _format_process_final_message(self, session_id: str, session, notify_mode: str) -> str:
-        """Human-facing completion message. Every mode shares the one-line status header; the
-        raw-output modes (all/result/error) append the bounded output tail under it instead of the
-        old bracketed ``[Background process proc_… finished~ …]`` debug wrapper (#54266)."""
-        from gateway.run import _format_concise_process_notification, _redact_gateway_user_facing_secrets
-        new_output = self._redacted_output_tail(session, 1000)
-        _started = getattr(session, "started_at", None)
-        _dur = max(0.0, time.time() - _started) if isinstance(_started, (int, float)) else None
-        command = _redact_gateway_user_facing_secrets(getattr(session, "command", "") or "")
-        if notify_mode == "concise":
-            return _format_concise_process_notification(session_id, command, session.exit_code, new_output,
-                                                        duration_seconds=_dur)
-        header = _format_concise_process_notification(session_id, command, session.exit_code, "", duration_seconds=_dur)
-        return t("gateway.background.final_output", header=header, output=new_output.strip()) if new_output.strip() else header
-
-    def _format_process_running_message(self, session) -> str:
-        from gateway.run import _redact_gateway_user_facing_secrets, _shorten_command_for_display
-        new_output = self._redacted_output_tail(session, 500)
-        short_cmd = _shorten_command_for_display(_redact_gateway_user_facing_secrets(getattr(session, "command", "") or ""))
-        header = t("gateway.background.still_running") + (f" — `{short_cmd}`" if short_cmd else "")
-        return t("gateway.background.recent_output", header=header, output=new_output.strip()) if new_output.strip() else header
 
     def arm_process_watcher(self, watcher: dict) -> bool:
         """Start ``_run_process_watcher`` for a watcher registered mid-turn, from the agent's
