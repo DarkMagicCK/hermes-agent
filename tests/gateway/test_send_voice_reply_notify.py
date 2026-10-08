@@ -102,7 +102,8 @@ async def test_voice_reply_marks_existing_thread_metadata_without_mutation(monke
 @pytest.mark.parametrize("platform", [Platform.FEISHU, Platform.TELEGRAM])
 @pytest.mark.parametrize("outcome", ["terminal", "transient", "success"])
 async def test_multipart_voice_stops_only_for_terminal_policy(platform, outcome):
-    from gateway.platforms.base import SendResult, _thread_metadata_for_event
+    from gateway.platforms.base import SendResult
+    from gateway.platforms.base_thread_metadata import _thread_metadata_for_event
 
     receipt = SendResult(
         success=outcome == "success", error=None if outcome == "success" else "voice delivery failed",
@@ -139,7 +140,7 @@ async def test_multipart_voice_stops_only_for_terminal_policy(platform, outcome)
 async def test_auto_voice_and_final_text_share_feishu_policy_on_the_wire(tmp_path, policy, text_first):
     from unittest.mock import Mock
     from gateway.config import PlatformConfig
-    from gateway.platforms.base import _thread_metadata_for_event
+    from gateway.platforms.base_thread_metadata import _thread_metadata_for_event
     from plugins.platforms.feishu.adapter import FeishuAdapter
 
     pytest.importorskip("lark_oapi")

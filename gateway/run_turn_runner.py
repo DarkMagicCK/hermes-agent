@@ -13,7 +13,6 @@ import json
 import logging
 import queue
 import re
-import threading
 import time
 from contextlib import suppress
 from datetime import datetime
@@ -27,6 +26,7 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.turn_context import TurnContext
+from gateway.run_turn_runner_review import TurnReviewCallbacksMixin
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
 
@@ -75,7 +75,7 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
-class TurnRunner:
+class TurnRunner(TurnReviewCallbacksMixin):
     """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
 
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
@@ -1214,43 +1214,6 @@ class TurnRunner:
                 self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line), "notice_callback delivery scheduling error")
         render_notification(present, platform=self._ctx.source.platform,
                             user_config=self._ctx.user_config, diagnostic=diagnostic)
-
-    def _make_bg_review_callbacks(self):
-        """(send, release): background-review messages ("💾 Memory updated") are held until the
-        adapter's post-delivery hook releases them after the main response lands."""
-        from gateway.run import _interim_metadata, _non_conversational_metadata
-        ctx = self._ctx
-        release_evt = threading.Event()
-        pending: list[str] = []
-        pending_lock = threading.Lock()
-
-        def deliver(message: str) -> None:
-            if self._status_live():
-                self._send_status_text(
-                    message,
-                    _interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)),
-                    "background_review_callback scheduling error",
-                )
-
-        def release() -> None:
-            release_evt.set()
-            with pending_lock:
-                queued = list(pending)
-                pending.clear()
-            for message in queued:
-                deliver(message)
-
-        def send(message: str) -> None:
-            if not self._status_live():
-                return
-            if not release_evt.is_set():
-                with pending_lock:
-                    if not release_evt.is_set():
-                        pending.append(message)
-                        return
-            deliver(message)
-
-        return send, release
 
     @staticmethod
     def _merge_turn_request_overrides(agent, turn_route) -> None:

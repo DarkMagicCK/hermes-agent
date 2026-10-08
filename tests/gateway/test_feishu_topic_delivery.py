@@ -305,7 +305,7 @@ async def test_bare_send_timeout_is_not_replayed_as_plaintext_and_disconnected_a
 async def test_silent_policy_cleans_processing_badge_without_exposing_failure_reaction(adapter, policy, code):
     from unittest.mock import AsyncMock
     from gateway.config import Platform
-    from gateway.platforms.base import _thread_metadata_for_event
+    from gateway.platforms.base_thread_metadata import _thread_metadata_for_event
     from gateway.platforms.event import MessageEvent, ProcessingOutcome
     from gateway.session import SessionSource
 

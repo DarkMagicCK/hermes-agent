@@ -20,6 +20,7 @@ import weakref
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
+from gateway.platforms import base_thread_metadata
 from utils import normalize_proxy_url
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
@@ -95,12 +96,6 @@ _HISTORY_MEDIA_LOOKUP_MAX_WORKERS = 2
 _HISTORY_MEDIA_LOOKUP_ADMISSION = threading.BoundedSemaphore(_HISTORY_MEDIA_LOOKUP_MAX_WORKERS)
 
 
-def _platform_name(platform) -> str:
-    """Normalize a Platform enum / raw string into a lowercase name."""
-    value = getattr(platform, "value", platform)
-    return str(value or "").lower()
-
-
 def _or_default(thunk, default, exc=(TypeError, ValueError)):
     """``thunk()``, or ``default`` when it raises one of ``exc`` (numeric config/env coercion)."""
     try:
@@ -111,89 +106,6 @@ def _or_default(thunk, default, exc=(TypeError, ValueError)):
 
 DEFAULT_BUSY_TEXT_DEBOUNCE_SECONDS = 0.35
 DEFAULT_BUSY_TEXT_HARD_CAP_SECONDS = 1.0
-
-
-def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) -> dict | None:
-    """Platform-aware thread metadata for adapter sends. Telegram DM topics route with
-    ``message_thread_id`` + a reply anchor; anchorless synthetic/resumed sends fall back to
-    ``direct_messages_topic_id`` when supported."""
-    thread_id = getattr(source, "thread_id", None)
-    platform = _platform_name(getattr(source, "platform", None))
-    metadata = {"thread_id": thread_id} if thread_id is not None else {}
-    # Slack workspace identity is routing state: carry it so a multi-workspace Socket Mode
-    # gateway never falls back to its primary WebClient.
-    scope_id = getattr(source, "scope_id", None) if platform == "slack" else None
-    if scope_id:
-        metadata["slack_team_id"] = str(scope_id)
-    if not metadata:
-        return None
-    if platform == "telegram" and getattr(source, "chat_type", None) == "dm":
-        metadata["telegram_dm_topic_reply_fallback"] = True
-        if str(thread_id) not in {"", "1"}:
-            metadata["direct_messages_topic_id"] = str(thread_id)
-        anchor = reply_to_message_id or getattr(source, "message_id", None)
-        if anchor is not None:
-            metadata["telegram_reply_to_message_id"] = str(anchor)
-    if platform == "feishu" and thread_id:
-        # Feishu topics have no create-message route: metadata-only sends need a real
-        # message anchor too (progress, notices, and post-stream attachments).
-        anchor = reply_to_message_id or getattr(source, "message_id", None)
-        if anchor is not None:
-            metadata["reply_to_message_id"] = str(anchor)
-    # Routed profile (multiplex / profile_routes): outbound prune paths must not assume the
-    # adapter's static profile stamp.
-    profile = str(getattr(source, "profile", None) or "").strip()
-    if profile:
-        metadata["hermes_profile"] = profile
-    return metadata
-
-
-def _thread_metadata_for_event(event) -> dict | None:
-    """``_thread_metadata_for_source`` for an event, anchored on its reply id."""
-    metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-    if (metadata is not None and _platform_name(getattr(event.source, "platform", None)) == "feishu"
-            and getattr(event.source, "thread_id", None)):
-        # Every send in this turn shares the topic-policy decision, including metadata
-        # rebuilt for progress, final text and attachments. Keep it off the serializable
-        # event.metadata/source so a later turn in this topic starts with a fresh decision.
-        state = getattr(event, "_feishu_topic_delivery", None)
-        if not isinstance(state, dict):
-            state = event._feishu_topic_delivery = {}
-        metadata["_feishu_topic_delivery"] = state
-    return metadata
-
-
-def _mark_notify_metadata(metadata: dict | None) -> dict:
-    """Clone metadata and mark a user-visible reply as notify-worthy."""
-    notify_metadata = dict(metadata) if metadata else {}
-    notify_metadata["notify"] = True
-    return notify_metadata
-
-
-def _reply_anchor_for_event(event) -> str | None:
-    """Return reply_to id for platforms that need reply semantics."""
-    override = getattr(event, "reply_anchor_override", None)
-    if override is not None:
-        return override  # the turn was redirected onto another message (#115001)
-    source = getattr(event, "source", None)
-    platform = _platform_name(getattr(source, "platform", None))
-    thread_id = getattr(source, "thread_id", None)
-    raw_message = getattr(event, "raw_message", None)
-    if (platform == "slack" and isinstance(raw_message, dict)
-            and raw_message.get("_hermes_no_thread_response")):
-        # Slack reaction handoff = new top-level message; a message_id anchor would make
-        # _resolve_thread_ts() reply in a nonexistent thread.
-        return None
-    if platform == "telegram" and thread_id:
-        # Forum topics route by topic metadata (no reply); DM-topic lanes reply to the triggering
-        # message — replying to the topic seed/anchor can render outside the active lane.
-        if getattr(source, "chat_type", None) != "dm":
-            return None
-        return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
-    if platform == "feishu" and thread_id:
-        return (getattr(event, "reply_to_message_id", None)
-                or getattr(event, "message_id", None) or getattr(source, "message_id", None))
-    return getattr(event, "message_id", None)
 
 
 _MEDIA_KIND_KEYS = frozenset({"audio", "video", "file", "image"})
@@ -215,7 +127,7 @@ def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bo
     normalized_ext = (ext or "").lower()
     if normalized_ext not in _AUDIO_EXTS:
         return False
-    if _platform_name(platform) != "telegram":
+    if base_thread_metadata._platform_name(platform) != "telegram":
         return True
     return is_voice or normalized_ext in _TELEGRAM_AUDIO_ATTACHMENT_EXTS
 
@@ -232,7 +144,7 @@ def build_auto_tts_output_path(platform) -> str:
     backends like Edge TTS. Everything else keeps the MP3 default. See #36685, #57049.
     """
     from tools.tts_tool import OPUS_VOICE_PLATFORMS
-    ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
+    ext = "ogg" if base_thread_metadata._platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
     audio_path = os.path.join(
         tempfile.gettempdir(), "hermes_voice", f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}")
     os.makedirs(os.path.dirname(audio_path), exist_ok=True)
@@ -3629,7 +3541,7 @@ class BasePlatformAdapter(ABC):
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
         """Call the handler and send its reply inline, with retry, threading and
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
-        thread_meta = _thread_metadata_for_event(event)
+        thread_meta = base_thread_metadata._thread_metadata_for_event(event)
         response = await self._message_handler(event)
         text, eph_ttl = self._unwrap_ephemeral(response)
         if not text:
@@ -3638,8 +3550,8 @@ class BasePlatformAdapter(ABC):
             logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
                         len(text), event.source.chat_id)
         result = await self._send_with_retry(
-            chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
-            metadata=_mark_notify_metadata(thread_meta))
+            chat_id=event.source.chat_id, content=text, reply_to=base_thread_metadata._reply_anchor_for_event(event),
+            metadata=base_thread_metadata._mark_notify_metadata(thread_meta))
         if eph_ttl > 0 and result.success and result.message_id:
             self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
 
@@ -3858,7 +3770,7 @@ class BasePlatformAdapter(ABC):
             source = getattr(candidate, "source", None)
             if source is None:
                 return None
-            platform = _platform_name(getattr(source, "platform", None))
+            platform = base_thread_metadata._platform_name(getattr(source, "platform", None))
             sender = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
             if sender:
                 return (platform, str(sender))
@@ -4463,7 +4375,7 @@ class BasePlatformAdapter(ABC):
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
-            reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response,
+            reply_to=base_thread_metadata._reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response,
             suppressed_result=getattr(event, "_delivery_retry_suppressed_result", None))
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
@@ -4474,7 +4386,7 @@ class BasePlatformAdapter(ABC):
         a failing notice is logged, never raised). Returns the thread metadata used."""
         _thread_metadata = None
         try:
-            _thread_metadata = _thread_metadata_for_event(event)
+            _thread_metadata = base_thread_metadata._thread_metadata_for_event(event)
             error_detail = str(e)[:300] if str(e) else t("gateway.notify.turn_error_no_details")
             # Only the policy reads bind the routed profile; the send stays in the launch scope
             # as before, so delivery bookkeeping keeps landing where boot-time recovery reads it.
@@ -4627,7 +4539,7 @@ class BasePlatformAdapter(ABC):
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
-        _thread_metadata = _thread_metadata_for_event(event)
+        _thread_metadata = base_thread_metadata._thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
             await self._run_processing_hook("on_processing_start", event)
@@ -4635,7 +4547,7 @@ class BasePlatformAdapter(ABC):
             response = await self._message_handler(event)
             # A queued chain may hand back the final of a newer event/turn. Refresh
             # its delivery scope instead of reusing the first turn's terminal state.
-            _thread_metadata = _thread_metadata_for_event(event)
+            _thread_metadata = base_thread_metadata._thread_metadata_for_event(event)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4659,7 +4571,7 @@ class BasePlatformAdapter(ABC):
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _final_thread_metadata = base_thread_metadata._mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
                 suppressed_result = getattr(event, "_delivery_retry_suppressed_result", None)
                 if (getattr(suppressed_result, "retry_suppressed", False) is not True

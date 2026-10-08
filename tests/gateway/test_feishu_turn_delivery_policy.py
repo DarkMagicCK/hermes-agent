@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, StreamingConfig
-from gateway.platforms.base import SendResult, _thread_metadata_for_event
+from gateway.platforms.base import SendResult
+from gateway.platforms.base_thread_metadata import _thread_metadata_for_event
 from gateway.platforms.event import MessageEvent
 from gateway.run_turn_runner import TurnRunner, _ExecApprovalDeclined
 from gateway.session import SessionSource
