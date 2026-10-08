@@ -202,7 +202,7 @@ def test_delegation_reply_not_in_core_tools():
     assert "delegate_tool_reply" not in _HERMES_CORE_TOOLS
 
 
-@pytest.mark.parametrize("toolset", [None, "hermes-cli", "hermes-telegram"])
+@pytest.mark.parametrize("toolset", [None, "all", "*", "hermes-cli", "hermes-telegram"])
 def test_parent_default_schemas_do_not_include_delivery(toolset):
     from model_tools import get_tool_definitions
     definitions = get_tool_definitions(
