@@ -17,6 +17,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner, _parse_session_key
+from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +278,9 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
     assert synth_event.source.thread_id == "42"
     assert synth_event.source.user_id == "123"
     assert synth_event.source.user_name == "Emiliyan"
-    assert synth_event.message_id == (event_anchor.strip() if event_anchor and event_anchor.strip() else "om_thread_root")
+    assert synth_event.message_id is None
+    assert synth_event.reply_anchor_override is None
+    assert synth_event.source.message_id is None
 
 
 @pytest.mark.asyncio
@@ -319,7 +322,8 @@ async def test_legacy_source_anchor_survives_second_detach(monkeypatch, tmp_path
     assert await runner._inject_watch_notification("first completion", evt) is True
     first = adapter.handle_message.await_args.args[0]
     expected_anchor = origin.message_id or "om_captured"
-    assert first.message_id == "om_captured"
+    assert first.message_id is None
+    assert first.reply_anchor_override == "om_captured"
     assert first.source.to_dict() == {**original_identity, "message_id": expected_anchor}
     assert first.source._transport_marker is transport_marker
     assert origin.to_dict() == original_identity
@@ -347,7 +351,8 @@ async def test_legacy_source_anchor_survives_second_detach(monkeypatch, tmp_path
         assert second["message_id"] == expected_anchor
         assert await runner._inject_watch_notification("second completion", second) is True
         reinjected = adapter.handle_message.await_args.args[0]
-        assert reinjected.message_id == expected_anchor
+        assert reinjected.message_id is None
+        assert reinjected.reply_anchor_override == expected_anchor
         assert reinjected.source.to_dict() == first.source.to_dict()
     finally:
         ad._reset_for_tests()
@@ -402,7 +407,17 @@ async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkey
 
 
 @pytest.mark.asyncio
-async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeypatch, tmp_path):
+async def test_inject_watch_notification_drops_stale_trigger_reply_anchor(monkeypatch, tmp_path):
+    """Regression for #52694: the synthetic watch event must not reuse the triggering
+    message id as its reply anchor.
+
+    The id names the message that STARTED the process; by the time the process exits the
+    user has often moved on, and a reply quoting that id answers a stale message (a finished
+    background job visibly replying to an old Discord DM message from another topic).
+    Routing stays on the persisted origin — Telegram DM-topic lanes route anchor-less
+    synthetic sends through the topic's message_thread_id (#87051) — and the original id
+    survives only as event metadata for debugging.
+    """
     from gateway.session import SessionSource
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
@@ -415,6 +430,7 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
             thread_id="24296",
             user_id="1",
             user_name="Fabio",
+            message_id="777",  # persisted origin: an equally stale triggering id
         )
     )
 
@@ -428,8 +444,21 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
 
     adapter.handle_message.assert_awaited_once()
     synth_event = adapter.handle_message.await_args.args[0]
-    assert synth_event.message_id == "777"
+    assert synth_event.internal is True
+    # No stale anchor on the event OR the restored origin it routes through.
+    assert synth_event.message_id is None
+    assert synth_event.source.message_id is None
+    # Routing provenance is untouched: the notification still lands in the origin topic.
     assert synth_event.source.thread_id == "24296"
+    # The derived final-reply anchor is empty on every platform branch.
+    from gateway.platforms.base import _reply_anchor_for_event
+    assert _reply_anchor_for_event(synth_event) is None
+    # The original id survives for debugging only.
+    assert synth_event.metadata["original_trigger_message_id"] == "777"
+    # Unambiguous machine provenance: SYSTEM prefix still leads, footer appended, origin tagged.
+    assert synth_event.text.startswith("[SYSTEM: ")
+    assert synth_event.text.rstrip().endswith(INTERNAL_NOTIFICATION_FOOTER)
+    assert synth_event.metadata["notification_origin"] == "process_registry_synthetic"
 
 
 @pytest.mark.asyncio
@@ -550,7 +579,8 @@ class TestConciseFormatter:
 
 
 @pytest.mark.asyncio
-async def test_concise_mode_sends_pretty_message_not_raw_dump(monkeypatch, tmp_path):
+@pytest.mark.parametrize("platform", [Platform.TELEGRAM, Platform.FEISHU])
+async def test_concise_mode_sends_pretty_message_not_raw_dump(monkeypatch, tmp_path, platform):
     """Default mode: a finished process produces the one-line status message,
     never the '[Background process ... Here's the final output: ...]' wall."""
     import tools.process_registry as pr_module
@@ -569,23 +599,28 @@ async def test_concise_mode_sends_pretty_message_not_raw_dump(monkeypatch, tmp_p
     monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
 
     runner = _build_runner(monkeypatch, tmp_path, "concise")
-    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter = runner.adapters.pop(Platform.TELEGRAM)
+    runner.adapters[platform] = adapter
+    watcher = _watcher_dict(thread_id="omt_topic", message_id="om_thread_root")
+    watcher.update(platform=platform.value, chat_type="group")
 
-    await runner._run_process_watcher(
-        _watcher_dict(thread_id="omt_topic", message_id="om_thread_root")
-    )
+    await runner._run_process_watcher(watcher)
 
     adapter.send.assert_awaited_once()
     sent_text = adapter.send.await_args.args[1]
     assert sent_text.startswith("✅ Background task finished")
     assert "Here's the final output" not in sent_text
     assert "5000" not in sent_text
-    assert adapter.send.await_args.kwargs["reply_to"] == "om_thread_root"
+    expected_anchor = "om_thread_root" if platform == Platform.FEISHU else None
+    assert adapter.send.await_args.kwargs.get("reply_to") == expected_anchor
+    if expected_anchor:
+        assert adapter.send.await_args.kwargs["metadata"]["reply_to_message_id"] == expected_anchor
 
 
 @pytest.mark.asyncio
-async def test_all_mode_threads_interim_and_final_notifications(monkeypatch, tmp_path):
-    """Both direct watcher send paths preserve the captured reply anchor."""
+@pytest.mark.parametrize("platform", [Platform.TELEGRAM, Platform.FEISHU])
+async def test_all_mode_threads_interim_and_final_notifications(monkeypatch, tmp_path, platform):
+    """Only Feishu topics require the captured anchor for both watcher send paths."""
     import tools.process_registry as pr_module
 
     running = SimpleNamespace(
@@ -605,15 +640,17 @@ async def test_all_mode_threads_interim_and_final_notifications(monkeypatch, tmp
     monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
-    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter = runner.adapters.pop(Platform.TELEGRAM)
+    runner.adapters[platform] = adapter
+    watcher = _watcher_dict(thread_id="omt_topic", message_id="om_thread_root")
+    watcher.update(platform=platform.value, chat_type="group")
 
-    await runner._run_process_watcher(
-        _watcher_dict(thread_id="omt_topic", message_id="om_thread_root")
-    )
+    await runner._run_process_watcher(watcher)
 
     assert adapter.send.await_count == 2
+    expected_anchor = "om_thread_root" if platform == Platform.FEISHU else None
     assert all(
-        call.kwargs["reply_to"] == "om_thread_root"
+        call.kwargs.get("reply_to") == expected_anchor
         for call in adapter.send.await_args_list
     )
 
@@ -763,9 +800,12 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
 
     assert result is True
     api_adapter.handle_message.assert_not_awaited()
-    assert posts == [
-        {"text": "[SYSTEM: subagent finished]", "session_id": "raw-hq-session-id"}
-    ]
+    # Same presentation contract as the push path: leading SYSTEM prefix intact, machine-origin
+    # footer appended — this text becomes a role=user turn on the stateless surface too.
+    assert len(posts) == 1
+    assert posts[0]["session_id"] == "raw-hq-session-id"
+    assert posts[0]["text"].startswith("[SYSTEM: subagent finished]")
+    assert posts[0]["text"].rstrip().endswith(INTERNAL_NOTIFICATION_FOOTER)
 
 
 @pytest.mark.asyncio
@@ -846,6 +886,8 @@ async def test_async_delegation_apiserver_persists_delivery_not_self_post(
     assert len(persisted) == 1
     assert persisted[0]["session_id"] == "raw-hq-session-id"
     assert persisted[0]["evt"]["delegation_id"] == "deleg_85957"
+    # Persist-only route stays verbatim: the client reads this row, no model turn is woken.
+    assert persisted[0]["text"] == "[ASYNC DELEGATION BATCH COMPLETE — deleg_85957]"
 
 
 @pytest.mark.asyncio

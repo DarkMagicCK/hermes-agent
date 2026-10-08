@@ -2,7 +2,8 @@
 WAL, owner pid + process-start liveness, bounded retention) so a crash between finalize and
 platform ACK cannot lose a response silently. Checkpoints: record_obligation() 'pending' before
 any send | mark_attempting() 'attempting' right before the await | mark_delivered() 'delivered'
-only on SendResult.success | mark_failed() 'failed' on a definitive rejection. Crash semantics
+only on SendResult.success | mark_failed() 'failed' on a definitive rejection or 'abandoned'
+on an explicit retry_suppressed policy outcome (the undelivered content/error remain). Crash semantics
 (never silently resend an ambiguous send): pending = never started, redeliver plainly; attempting
 = crashed mid-await, platform MAY have it, redeliver WITH a visible recovered marker; failed =
 rejected once, restart is a retry boundary, also marked; delivered = prune. Attempts are capped
@@ -268,18 +269,23 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
-    """Record a final response as owed to the platform (state='pending')."""
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      retry_suppressed: bool = False, error: str = "") -> None:
+    """Record a final response as owed, or atomically retain an already-terminal failure.
+    A stream/queued policy outcome must never become restart-recoverable between recording
+    its completed final text and finalizing its ledger row."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, adapter_profile, last_error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+             content, "abandoned" if retry_suppressed else "pending", now, now, pid, started,
+             str(adapter_profile).strip() if adapter_profile else "default",
+             f"retry_suppressed: {error}"[:500] if retry_suppressed else None))
         # Same transaction, same connection: the cron ledgers prune this way too
         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
         _prune_unlocked(conn, now)
@@ -315,8 +321,14 @@ def mark_delivered(obligation_id: str) -> None:
     _update_state(obligation_id, "delivered")
 
 
-def mark_failed(obligation_id: str, error: str = "") -> None:
-    _update_state(obligation_id, "failed", error=error)
+def mark_failed(obligation_id: str, error: str = "", *, retry_suppressed: bool = False) -> None:
+    """Retain a rejected reply; an explicit terminal adapter policy abandons it without
+    claiming delivery. The diagnostic and policy reason survive restart; neither recovery
+    sweep nor the runtime timer selects abandoned rows."""
+    if retry_suppressed:
+        _update_state(obligation_id, "abandoned", error=f"retry_suppressed: {error}")
+    else:
+        _update_state(obligation_id, "failed", error=error)
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
@@ -562,33 +574,3 @@ def ledger_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
         return value.strip().lower() not in {"false", "0", "no", "off"} if isinstance(value, str) else bool(value)
     except Exception:
         return True
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import json  # noqa: F401,E402
-import json  # noqa: F401,E402
-
-def debug_rows(limit: int = 20) -> str:
-    """Human-readable dump for ad-hoc inspection (sqlite3-free path)."""
-    with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute(
-            """SELECT obligation_id, session_key, state, attempts,
-                      created_at, updated_at, last_error
-               FROM delivery_obligations
-               ORDER BY updated_at DESC LIMIT ?""",
-            (limit,),
-        ).fetchall()
-    return json.dumps(
-        [
-            {
-                "id": r[0], "session": r[1], "state": r[2], "attempts": r[3],
-                "created_at": r[4], "updated_at": r[5], "last_error": r[6],
-            }
-            for r in rows
-        ],
-        indent=2,
-    )
-# ---- END PLUGIN-COMPAT ----
