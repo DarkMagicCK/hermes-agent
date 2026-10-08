@@ -389,12 +389,12 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
             return list(cached)
         visited = set()
 
-    # "all"/"*" span every toolset so new toolsets are included automatically, except the ones a
-    # session platform gates: a profile gets those only when its config names them.
+    # "all"/"*" span public toolsets; session-gated and child-only delivery toolsets
+    # require explicit grants from their owning surface or child construction.
     if name in {"all", "*"}:
         all_tools: Set[str] = set()
         for toolset_name in get_toolset_names():
-            if toolset_name not in TOOLSET_SESSION_PLATFORMS:
+            if toolset_name != "delegation_reply" and toolset_name not in TOOLSET_SESSION_PLATFORMS:
                 all_tools.update(resolve_toolset(toolset_name, visited.copy(), include_registry=include_registry))
         return sorted(all_tools)
 
