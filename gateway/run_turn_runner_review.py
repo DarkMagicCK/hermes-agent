@@ -44,4 +44,3 @@ class TurnReviewCallbacksMixin:
             deliver(message)
 
         return send, release
-

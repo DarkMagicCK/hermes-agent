@@ -96,4 +96,3 @@ class GatewayProcessNotificationMixin:
         short_cmd = _shorten_command_for_display(_redact_gateway_user_facing_secrets(getattr(session, "command", "") or ""))
         header = t("gateway.background.still_running") + (f" — `{short_cmd}`" if short_cmd else "")
         return t("gateway.background.recent_output", header=header, output=new_output.strip()) if new_output.strip() else header
-

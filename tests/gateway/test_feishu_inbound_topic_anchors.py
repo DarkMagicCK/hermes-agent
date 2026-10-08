@@ -143,4 +143,3 @@ class TestTopicAnchors(unittest.TestCase):
 
         self.assertIn("hello from feishu", text)
         self.assertIn("[Content of", text)
-
