@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import _thread_metadata_for_source
+from gateway.platforms.base_thread_metadata import _thread_metadata_for_source
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
