@@ -161,6 +161,8 @@ class FeishuTopicDeliveryMixin:
         try:
             home = self._resolve_topic_home(metadata)
         except Exception as exc:
+            logger.error("[Feishu] Home resolution failed",
+                         exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
             return self._stop_topic_fallback(state, "home_unavailable", type(exc).__name__)
         if home is None or _identifier(home.chat_id) == chat_id:
             return self._stop_topic_fallback(state, "home_unavailable", response.code)
@@ -183,6 +185,8 @@ class FeishuTopicDeliveryMixin:
         try:
             response = await self._run_blocking(client.im.v1.message.list, request)
         except Exception as exc:
+            logger.error("[Feishu] Topic lookup failed",
+                         exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
             # No outbound message was attempted: inability to read history is distinct
             # from an ambiguous send and may use the configured parent-chat policy.
             return SendResult(success=False, error=f"Feishu topic lookup failed ({type(exc).__name__})")
@@ -253,8 +257,26 @@ class FeishuTopicDeliveryMixin:
                                  _safe_parameter(getattr(notice, "code", None)))
             except Exception as exc:
                 logger.error("[Feishu] Topic diagnostic failed ref=%s exception=%s", correlation_id,
-                             type(exc).__name__)
+                             type(exc).__name__,
+                             exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         return result
+
+    async def _send_without_topic(
+        self: "FeishuAdapter", *, chat_id: str, msg_type: str, payload: str, anchor: str | None,
+        metadata: dict | None,
+    ) -> Any:
+        home_state = topic_delivery_state(metadata)
+        home_state = home_state if home_state.get("fallback_disabled") else None
+        response = await self._send_raw_with_retry(
+            chat_id=chat_id, msg_type=msg_type, payload=payload, reply_to=anchor, metadata=metadata,
+            delivery_state=home_state)
+        if home_state and home_state.get("ambiguous_send") and not self._response_succeeded(response):
+            return self._stop_topic_fallback(home_state, "home_send_uncertain")
+        if anchor and not self._response_succeeded(response) and getattr(response, "code", None) in _REPLY_MISSING_CODES:
+            return await self._send_raw_with_retry(
+                chat_id=chat_id, msg_type=msg_type, payload=payload, reply_to=None, metadata=None)
+        return response
+
 
     async def _feishu_send_with_retry(
         self: "FeishuAdapter", *, chat_id: str, msg_type: str, payload: str, reply_to: str | None, metadata: dict | None,
@@ -262,17 +284,8 @@ class FeishuTopicDeliveryMixin:
         thread_id = _identifier((metadata or {}).get("thread_id"))
         anchor = _identifier(reply_to) or _identifier((metadata or {}).get("reply_to_message_id")) or None
         if not thread_id:
-            home_state = topic_delivery_state(metadata)
-            home_state = home_state if home_state.get("fallback_disabled") else None
-            response = await self._send_raw_with_retry(
-                chat_id=chat_id, msg_type=msg_type, payload=payload, reply_to=anchor, metadata=metadata,
-                delivery_state=home_state)
-            if home_state and home_state.get("ambiguous_send") and not self._response_succeeded(response):
-                return self._stop_topic_fallback(home_state, "home_send_uncertain")
-            if anchor and not self._response_succeeded(response) and getattr(response, "code", None) in _REPLY_MISSING_CODES:
-                return await self._send_raw_with_retry(
-                    chat_id=chat_id, msg_type=msg_type, payload=payload, reply_to=None, metadata=None)
-            return response
+            return await self._send_without_topic(
+                chat_id=chat_id, msg_type=msg_type, payload=payload, anchor=anchor, metadata=metadata)
 
         state = topic_delivery_state(metadata)
         # One turn can send progress, stream chunks, final text and media concurrently. Serialize
